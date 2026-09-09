@@ -9,10 +9,57 @@ const ROOT=path.join(__dirname,'public');
 const DB=path.join(__dirname,'accounts.json');
 const sessions=new Map();
 const worldPresence=new Map();
+const worldStates=new Map();
 function cleanWorld(v){return String(v||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,18)}
 function pruneRoom(world){const room=worldPresence.get(world);if(!room)return;const cutoff=Date.now()-15000;for(const [id,st] of room){if(st.lastSeen<cutoff)room.delete(id)}if(!room.size)worldPresence.delete(world)}
 function updatePresence(world,p,b){if(!worldPresence.has(world))worldPresence.set(world,new Map());const room=worldPresence.get(world),prev=room.get(p.playerId)||{};room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,lastSeen:Date.now()})}
 function roomView(world,selfId){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId).map(({lastSeen,...p})=>p):[]}
+
+
+function sanitizeWorldSnapshot(input){
+  const s=(input&&typeof input==='object')?input:{};
+  const blocks=Array.isArray(s.blocks)?s.blocks.slice(0,20000).filter(b=>b&&Number.isFinite(Number(b.x))&&Number.isFinite(Number(b.y))&&typeof b.t==='string').map(b=>({x:Number(b.x),y:Number(b.y),t:String(b.t).slice(0,32)})):[];
+  const door=(s.door&&Number.isFinite(Number(s.door.x))&&Number.isFinite(Number(s.door.y)))?{x:Number(s.door.x),y:Number(s.door.y),w:Number(s.door.w)||36,h:Number(s.door.h)||40}:null;
+  return {
+    worldId:String(s.worldId||'').slice(0,64),
+    surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,
+    blocks,
+    door,
+    caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],
+    plants:Array.isArray(s.plants)?s.plants.slice(0,5000):[],
+    locks:Array.isArray(s.locks)?s.locks.slice(0,1000):[],
+    weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],
+    weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},
+    coins:Array.isArray(s.coins)?s.coins.slice(0,5000):[],
+    coinsCollected:Math.max(0,Number(s.coinsCollected||0))
+  };
+}
+function getOrCreateWorldState(world,clientSnapshot){
+  let state=worldStates.get(world);
+  if(!state){
+    state={revision:1,snapshot:sanitizeWorldSnapshot(clientSnapshot),updatedAt:Date.now()};
+    worldStates.set(world,state);
+  }
+  return state;
+}
+function applyWorldAction(state,action){
+  if(!state||!action||typeof action!=='object')return false;
+  const tx=Math.floor(Number(action.tx)),ty=Math.floor(Number(action.ty));
+  if(!Number.isFinite(tx)||!Number.isFinite(ty)||tx<0||ty<0||tx>=100||ty>=100)return false;
+  const px=tx*40,py=ty*40,key=(b)=>Math.floor(Number(b.x)/40)===tx&&Math.floor(Number(b.y)/40)===ty;
+  if(action.type==='break'){
+    const before=state.snapshot.blocks.length;
+    state.snapshot.blocks=state.snapshot.blocks.filter(b=>!key(b));
+    if(state.snapshot.blocks.length===before)return false;
+  }else if(action.type==='place'){
+    const type=String(action.blockType||'').slice(0,32);
+    if(!type||state.snapshot.blocks.some(key))return false;
+    state.snapshot.blocks.push({x:px,y:py,t:type});
+  }else return false;
+  state.revision++;
+  state.updatedAt=Date.now();
+  return true;
+}
 
 function loadDb(){try{return JSON.parse(fs.readFileSync(DB,'utf8'))}catch(_){return {accounts:{}}}}
 function saveDb(db){fs.writeFileSync(DB,JSON.stringify(db,null,2))}
@@ -26,7 +73,7 @@ function hashPassword(password,salt=crypto.randomBytes(16).toString('hex')){
 }
 function verifyPassword(password,stored){const got=hashPassword(password,stored.salt).hash;return crypto.timingSafeEqual(Buffer.from(got,'hex'),Buffer.from(stored.hash,'hex'))}
 function send(res,status,obj){const data=JSON.stringify(obj);res.writeHead(status,{'Content-Type':'application/json','Content-Length':Buffer.byteLength(data),'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Allow-Methods':'POST, OPTIONS'});res.end(data)}
-function readJson(req){return new Promise((resolve,reject)=>{let body='';req.on('data',c=>{body+=c;if(body.length>20000)req.destroy()});req.on('end',()=>{try{resolve(body?JSON.parse(body):{})}catch(e){reject(e)}});req.on('error',reject)})}
+function readJson(req){return new Promise((resolve,reject)=>{let body='';req.on('data',c=>{body+=c;if(body.length>5_000_000){reject(new Error('PAYLOAD_TOO_LARGE'));req.destroy()}});req.on('end',()=>{try{resolve(body?JSON.parse(body):{})}catch(e){reject(e)}});req.on('error',reject)})}
 function authToken(req){const h=String(req.headers.authorization||'');return h.startsWith('Bearer ')?h.slice(7):''}
 function playerPayload(p){return {playerId:p.playerId,displayName:p.displayName,accountId:p.accountId||null,accountType:p.accountType}}
 function createSession(player){const t=token();sessions.set(t,{player,createdAt:Date.now()});return t}
@@ -58,10 +105,13 @@ async function api(req,res){
     const t=authToken(req),session=sessions.get(t);if(session){for(const [world,room] of worldPresence){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(world)}}if(t)sessions.delete(t);return send(res,200,{ok:true});
   }
   if(req.url==='/api/world/join'){
-    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}updatePresence(world,session.player,body);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId)});
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot});
   }
   if(req.url==='/api/world/state'){
-    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});updatePresence(world,session.player,body);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),serverTime:Date.now()});
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});updatePresence(world,session.player,body);const state=worldStates.get(world);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state?state.revision:0,...(state&&known<state.revision?{worldSnapshot:state.snapshot}:{}),serverTime:Date.now()});
+  }
+  if(req.url==='/api/world/action'){
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=worldStates.get(world);if(!state)return send(res,409,{error:'WORLD_NOT_READY'});applyWorldAction(state,body.action);return send(res,200,{ok:true,world,revision:state.revision,worldSnapshot:state.snapshot});
   }
   if(req.url==='/api/world/leave'){
     const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world),room=worldPresence.get(world);if(room){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(world)}return send(res,200,{ok:true});
@@ -76,4 +126,4 @@ function staticFile(req,res){
 }
 
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
-server.listen(PORT,()=>console.log(`Pixora Build 14 auth server running on http://localhost:${PORT}`));
+server.listen(PORT,()=>console.log(`Pixora Build 14.2.2 multiplayer world server running on http://localhost:${PORT}`));
