@@ -1,7 +1,8 @@
 {
-  "name":"pixora-build14-server",
-  "version":"14.4.0",
-  "private":true,
-  "scripts":{"start":"node server.js"},
-  "engines":{"node":">=18"}
+  "name": "pixora-server",
+  "version": "14.5.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
 }
