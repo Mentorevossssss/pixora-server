@@ -42,22 +42,38 @@ function getOrCreateWorldState(world,clientSnapshot){
   }
   return state;
 }
+function sanitizePlant(p,tx,ty){
+  if(!p||typeof p!=='object')return null;
+  const seed=String(p.seed||'').slice(0,40);if(!seed)return null;
+  return {tx,ty,seed,spliced:!!p.spliced,rarity:Math.max(1,Math.min(99,Number(p.rarity||1))),plantedAt:Math.max(0,Number(p.plantedAt||Date.now())),growMs:Math.max(1000,Number(p.growMs||10000))};
+}
 function applyWorldAction(state,action){
   if(!state||!action||typeof action!=='object')return false;
   const tx=Math.floor(Number(action.tx)),ty=Math.floor(Number(action.ty));
   if(!Number.isFinite(tx)||!Number.isFinite(ty)||tx<0||ty<0||tx>=100||ty>=100)return false;
   const px=tx*40,py=ty*40,key=(b)=>Math.floor(Number(b.x)/40)===tx&&Math.floor(Number(b.y)/40)===ty;
+  let changed=false;
   if(action.type==='break'){
     const before=state.snapshot.blocks.length;
     state.snapshot.blocks=state.snapshot.blocks.filter(b=>!key(b));
-    if(state.snapshot.blocks.length===before)return false;
+    changed=state.snapshot.blocks.length!==before;
+    // Idempotent: already broken is still a successful action.
   }else if(action.type==='place'){
-    const type=String(action.blockType||'').slice(0,32);
-    if(!type||state.snapshot.blocks.some(key))return false;
-    state.snapshot.blocks.push({x:px,y:py,t:type});
+    const type=String(action.blockType||'').slice(0,32);if(!type)return false;
+    const existing=state.snapshot.blocks.find(key);
+    if(existing){if(existing.t!==type)return false}else{state.snapshot.blocks.push({x:px,y:py,t:type});changed=true}
+  }else if(action.type==='break-bg'){
+    const k=tx+','+ty;if(!state.snapshot.caveBgRemoved.includes(k)){state.snapshot.caveBgRemoved.push(k);changed=true}
+  }else if(action.type==='plant-upsert'){
+    const plant=sanitizePlant(action.plant,tx,ty);if(!plant)return false;
+    const i=state.snapshot.plants.findIndex(p=>Number(p.tx)===tx&&Number(p.ty)===ty);
+    if(i>=0)state.snapshot.plants[i]=plant;else state.snapshot.plants.push(plant);changed=true;
+  }else if(action.type==='plant-remove'){
+    const before=state.snapshot.plants.length;
+    state.snapshot.plants=state.snapshot.plants.filter(p=>!(Number(p.tx)===tx&&Number(p.ty)===ty));
+    changed=state.snapshot.plants.length!==before;
   }else return false;
-  state.revision++;
-  state.updatedAt=Date.now();
+  if(changed){state.revision++;state.updatedAt=Date.now()}
   return true;
 }
 
@@ -90,12 +106,13 @@ async function api(req,res){
     const id=cleanId(body.id),pw=String(body.password||''),base=cleanName(body.name);
     if(id.length<3||pw.length<6)return send(res,400,{error:'BAD_REQUEST'});
     if(db.accounts[id])return send(res,409,{error:'ACCOUNT_EXISTS'});
-    const pass=hashPassword(pw);const account={id,playerId:'A-'+crypto.randomUUID(),displayName:`${base}_#${suffix()}`,pass,createdAt:Date.now()};db.accounts[id]=account;saveDb(db);
+    const pass=hashPassword(pw);const account={id,playerId:'A-'+crypto.randomUUID(),displayName:base,pass,createdAt:Date.now()};db.accounts[id]=account;saveDb(db);
     const player={playerId:account.playerId,displayName:account.displayName,accountId:id,accountType:'account'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)});
   }
   if(req.url==='/api/login'){
     const id=cleanId(body.id),pw=String(body.password||''),account=db.accounts[id];
     if(!account||!verifyPassword(pw,account.pass))return send(res,401,{error:'INVALID_CREDENTIALS'});
+    const migrated=String(account.displayName||'Player').replace(/_#\d{4}$/,'');if(migrated!==account.displayName){account.displayName=migrated;db.accounts[id]=account;saveDb(db)}
     const player={playerId:account.playerId,displayName:account.displayName,accountId:id,accountType:'account'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)});
   }
   if(req.url==='/api/session'){
@@ -111,7 +128,7 @@ async function api(req,res){
     const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});updatePresence(world,session.player,body);const state=worldStates.get(world);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state?state.revision:0,...(state&&known<state.revision?{worldSnapshot:state.snapshot}:{}),serverTime:Date.now()});
   }
   if(req.url==='/api/world/action'){
-    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=worldStates.get(world);if(!state)return send(res,409,{error:'WORLD_NOT_READY'});applyWorldAction(state,body.action);return send(res,200,{ok:true,world,revision:state.revision,worldSnapshot:state.snapshot});
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=worldStates.get(world);if(!state)return send(res,409,{error:'WORLD_NOT_READY'});const accepted=applyWorldAction(state,body.action);return send(res,accepted?200:409,{ok:accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(accepted?{}:{error:'ACTION_REJECTED'})});
   }
   if(req.url==='/api/world/leave'){
     const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const world=cleanWorld(body.world),room=worldPresence.get(world);if(room){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(world)}return send(res,200,{ok:true});
@@ -126,4 +143,4 @@ function staticFile(req,res){
 }
 
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
-server.listen(PORT,()=>console.log(`Pixora Build 14.2.2 multiplayer world server running on http://localhost:${PORT}`));
+server.listen(PORT,()=>console.log(`Pixora Build 14.3 multiplayer world server running on http://localhost:${PORT}`));
