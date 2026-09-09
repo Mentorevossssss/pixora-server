@@ -1,32 +1,67 @@
 'use strict';
+
 const http=require('http');
 const fs=require('fs');
 const path=require('path');
 const crypto=require('crypto');
+let PgPool=null;
+try{PgPool=require('pg').Pool}catch(_){ }
 
 const PORT=Number(process.env.PORT||3000);
 const ROOT=path.join(__dirname,'public');
-const DB=path.join(__dirname,'accounts.json');
+const FILE_DB=path.join(__dirname,'accounts.json');
+const DATABASE_URL=String(process.env.DATABASE_URL||'').trim();
 const sessions=new Map();
 const revokedTokens=new Map();
 const activeAccountTokens=new Map();
 const worldPresence=new Map();
 const worldStates=new Map();
 
+let dbCache={accounts:{},worlds:{}};
+let pgPool=null;
+let storageMode='file';
+let persistQueue=Promise.resolve();
+
 function cleanWorld(v){return String(v||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,18)}
 function cleanId(v){return String(v||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,24)}
 function cleanName(v){let s=String(v||'Player').trim().replace(/[^\p{L}\p{N}_ -]/gu,'').slice(0,12);return s||'Player'}
 function suffix(){return String(1000+crypto.randomInt(9000))}
 function token(){return crypto.randomBytes(32).toString('hex')}
+function randomId(prefix='D'){return `${prefix}-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`}
 function hashPassword(password,salt=crypto.randomBytes(16).toString('hex')){return {salt,hash:crypto.scryptSync(String(password),salt,64).toString('hex')}}
 function verifyPassword(password,stored){
   try{const got=hashPassword(password,stored.salt).hash;return crypto.timingSafeEqual(Buffer.from(got,'hex'),Buffer.from(stored.hash,'hex'))}catch(_){return false}
 }
-function loadDb(){
-  try{const d=JSON.parse(fs.readFileSync(DB,'utf8'));if(!d.accounts)d.accounts={};if(!d.worlds)d.worlds={};return d}
-  catch(_){return {accounts:{},worlds:{}}}
+function normalizeDb(d){if(!d||typeof d!=='object')d={};if(!d.accounts||typeof d.accounts!=='object')d.accounts={};if(!d.worlds||typeof d.worlds!=='object')d.worlds={};return d}
+function readFileDb(){try{return normalizeDb(JSON.parse(fs.readFileSync(FILE_DB,'utf8')))}catch(_){return {accounts:{},worlds:{}}}}
+function writeFileBackup(db){try{const tmp=FILE_DB+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2));fs.renameSync(tmp,FILE_DB)}catch(e){console.warn('file backup failed:',e.message)}}
+async function initStorage(){
+  dbCache=readFileDb();
+  if(DATABASE_URL&&PgPool){
+    try{
+      pgPool=new PgPool({connectionString:DATABASE_URL,ssl:DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}});
+      await pgPool.query('CREATE TABLE IF NOT EXISTS pixora_state (id INTEGER PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
+      const r=await pgPool.query('SELECT data FROM pixora_state WHERE id=1');
+      if(r.rows[0]?.data)dbCache=normalizeDb(r.rows[0].data);
+      else await pgPool.query('INSERT INTO pixora_state(id,data,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO NOTHING',[JSON.stringify(dbCache)]);
+      storageMode='postgres';
+      writeFileBackup(dbCache);
+      console.log('Pixora persistence: PostgreSQL');
+      return;
+    }catch(e){console.error('PostgreSQL init failed, using local file fallback:',e.message);try{await pgPool?.end()}catch(_){}pgPool=null}
+  }
+  storageMode='file';
+  console.warn('Pixora persistence: local file only. Set DATABASE_URL for durable accounts/worlds across Render redeploys.');
 }
-function saveDb(db){const tmp=DB+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2));fs.renameSync(tmp,DB)}
+function loadDb(){return dbCache}
+function saveDb(db){
+  dbCache=normalizeDb(db);writeFileBackup(dbCache);
+  if(pgPool){
+    const snapshot=JSON.stringify(dbCache);
+    persistQueue=persistQueue.then(()=>pgPool.query('INSERT INTO pixora_state(id,data,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()',[snapshot])).catch(e=>console.error('PostgreSQL save failed:',e.message));
+  }
+}
+
 function send(res,status,obj){
   const data=JSON.stringify(obj);res.writeHead(status,{'Content-Type':'application/json','Content-Length':Buffer.byteLength(data),'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Allow-Methods':'POST, OPTIONS'});res.end(data)
 }
@@ -46,21 +81,18 @@ function createSession(player){
 }
 function removePresence(playerId){for(const [world,room] of worldPresence){room.delete(playerId);if(!room.size)worldPresence.delete(world)}}
 function sessionFor(req){
-  const t=authToken(req);
-  if(revokedTokens.has(t))return {token:t,error:revokedTokens.get(t).reason||'INVALID_SESSION'};
+  const t=authToken(req);if(revokedTokens.has(t))return {token:t,error:revokedTokens.get(t).reason||'INVALID_SESSION'};
   const session=sessions.get(t);return session?{token:t,session}:{token:t,error:'INVALID_SESSION'}
 }
-function requireSession(req,res){
-  const s=sessionFor(req);if(s.error){send(res,401,{error:s.error});return null}return s
-}
+function requireSession(req,res){const s=sessionFor(req);if(s.error){send(res,401,{error:s.error});return null}return s}
 setInterval(()=>{const cutoff=Date.now()-6*60*60*1000;for(const [t,v] of revokedTokens)if(v.at<cutoff)revokedTokens.delete(t)},60*60*1000).unref?.();
 
 function pruneRoom(world){const room=worldPresence.get(world);if(!room)return;const cutoff=Date.now()-12000;for(const [id,st] of room){if(st.lastSeen<cutoff)room.delete(id)}if(!room.size)worldPresence.delete(world)}
 function sanitizeActionState(a){
-  if(!a||typeof a!=='object'||!a.active)return {active:false};
-  const tx=Math.floor(Number(a.tx)),ty=Math.floor(Number(a.ty));if(!Number.isFinite(tx)||!Number.isFinite(ty))return {active:false};
+  if(!a||typeof a!=='object'||!a.active)return {active:false,seq:Math.max(0,Math.floor(Number(a?.seq||0)))};
+  const tx=Math.floor(Number(a.tx)),ty=Math.floor(Number(a.ty));if(!Number.isFinite(tx)||!Number.isFinite(ty))return {active:false,seq:Math.max(0,Math.floor(Number(a.seq||0)))};
   const kind=['block','bg','air'].includes(String(a.kind))?String(a.kind):'air';
-  return {active:true,kind,tx,ty,progress:Math.max(0,Math.min(1,Number(a.progress||0))),tool:String(a.tool||'punch').slice(0,16)}
+  return {active:true,kind,tx,ty,progress:Math.max(0,Math.min(1,Number(a.progress||0))),tool:String(a.tool||'punch').slice(0,16),seq:Math.max(0,Math.floor(Number(a.seq||0)))}
 }
 function updatePresence(world,p,b){
   if(!worldPresence.has(world))worldPresence.set(world,new Map());
@@ -69,23 +101,17 @@ function updatePresence(world,p,b){
 }
 function roomView(world,selfId){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId).map(({lastSeen,...p})=>p):[]}
 
-function sanitizeDrop(d){
-  if(!d||typeof d!=='object')return null;const id=String(d.id||'').slice(0,80),kind=d.kind==='gems'?'gems':'item',item=kind==='item'?String(d.item||'').slice(0,40):null;
-  if(!id||(kind==='item'&&!item))return null;
-  return {id,x:Number(d.x)||0,y:Number(d.y)||0,item,kind,amount:Math.max(1,Math.min(9999,Math.floor(Number(d.amount||1)))),pickupAfter:Math.max(0,Number(d.pickupAfter||0))}
+function sanitizeDrop(d,{serverId=false}={}){
+  if(!d||typeof d!=='object')return null;
+  const kind=d.kind==='gems'?'gems':'item',item=kind==='item'?String(d.item||'').slice(0,40):null;
+  if(kind==='item'&&!item)return null;
+  return {id:serverId?randomId(kind==='gems'?'G':'D'):String(d.id||randomId(kind==='gems'?'G':'D')).slice(0,80),x:Number(d.x)||0,y:Number(d.y)||0,item,kind,amount:Math.max(1,Math.min(9999,Math.floor(Number(d.amount||1)))),pickupAfter:Math.max(0,Number(d.pickupAfter||0))}
 }
 function sanitizeWorldSnapshot(input){
   const s=(input&&typeof input==='object')?input:{};
   const blocks=Array.isArray(s.blocks)?s.blocks.slice(0,20000).filter(b=>b&&Number.isFinite(Number(b.x))&&Number.isFinite(Number(b.y))&&typeof b.t==='string').map(b=>({x:Number(b.x),y:Number(b.y),t:String(b.t).slice(0,32)})):[];
   const door=(s.door&&Number.isFinite(Number(s.door.x))&&Number.isFinite(Number(s.door.y)))?{x:Number(s.door.x),y:Number(s.door.y),w:Number(s.door.w)||36,h:Number(s.door.h)||40}:null;
-  return {
-    worldId:String(s.worldId||'').slice(0,64),surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,blocks,door,
-    caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],
-    plants:Array.isArray(s.plants)?s.plants.slice(0,5000):[],locks:Array.isArray(s.locks)?s.locks.slice(0,1000):[],weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],
-    weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},
-    coins:Array.isArray(s.coins)?s.coins.slice(0,5000):[],coinsCollected:Math.max(0,Number(s.coinsCollected||0)),
-    drops:Array.isArray(s.drops)?s.drops.slice(0,5000).map(sanitizeDrop).filter(Boolean):[]
-  }
+  return {worldId:String(s.worldId||'').slice(0,64),surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,blocks,door,caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],plants:Array.isArray(s.plants)?s.plants.slice(0,5000):[],locks:Array.isArray(s.locks)?s.locks.slice(0,1000):[],weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},drops:Array.isArray(s.drops)?s.drops.slice(0,5000).map(sanitizeDrop).filter(Boolean):[]}
 }
 function sanitizePlant(p,tx,ty){
   if(!p||typeof p!=='object')return null;const seed=String(p.seed||'').slice(0,40);if(!seed)return null;
@@ -93,46 +119,80 @@ function sanitizePlant(p,tx,ty){
 }
 function loadWorldFromDb(world){
   const db=loadDb(),raw=db.worlds?.[world];if(!raw)return null;
-  const state={revision:Math.max(1,Number(raw.revision||1)),snapshot:sanitizeWorldSnapshot(raw.snapshot),chat:Array.isArray(raw.chat)?raw.chat.slice(-30):[],updatedAt:Number(raw.updatedAt||Date.now())};
-  worldStates.set(world,state);return state
+  const state={revision:Math.max(1,Number(raw.revision||1)),snapshot:sanitizeWorldSnapshot(raw.snapshot),chat:Array.isArray(raw.chat)?raw.chat.slice(-30):[],updatedAt:Number(raw.updatedAt||Date.now())};worldStates.set(world,state);return state
 }
-function persistWorld(world,state){
-  const db=loadDb();db.worlds[world]={revision:state.revision,snapshot:state.snapshot,chat:(state.chat||[]).slice(-30),updatedAt:Date.now()};saveDb(db)
+function persistWorld(world,state){const db=loadDb();db.worlds[world]={revision:state.revision,snapshot:state.snapshot,chat:(state.chat||[]).slice(-30),updatedAt:Date.now()};saveDb(db)}
+function getOrCreateWorldState(world,clientSnapshot){let state=worldStates.get(world)||loadWorldFromDb(world);if(!state){state={revision:1,snapshot:sanitizeWorldSnapshot(clientSnapshot),chat:[],updatedAt:Date.now()};worldStates.set(world,state);persistWorld(world,state)}return state}
+
+const DROP_RATE={grass:{block:.42,seed:.30,gems:.28},dirt:{block:.38,seed:.20,gems:.24},stone:{block:.32,seed:.08,gems:.34},wood:{block:.45,seed:.24,gems:.25},leaf:{block:.24,seed:.42,gems:.22},sand:{block:.40,seed:.18,gems:.22},glass:{block:.31,seed:.12,gems:.38},brick:{block:.36,seed:.12,gems:.32},ice:{block:.34,seed:.22,gems:.30},metal:{block:.28,seed:.06,gems:.46},caveStone:{block:.32,seed:.10,gems:.40},moss:{block:.36,seed:.34,gems:.24},lava:{block:.22,seed:0,gems:.44},farmBlock:{block:.46,seed:.34,gems:.38}};
+const SEED_FOR_BLOCK={grass:'grassSeed',dirt:'dirtSeed',stone:'stoneSeed',wood:'woodSeed',leaf:'leafSeed',sand:'sandSeed',glass:'glassSeed',brick:'brickSeed',ice:'iceSeed',metal:'metalSeed',caveStone:'caveStoneSeed',moss:'mossSeed',farmBlock:'farmSeed'};
+const BLOCK_RARITY={grass:1,dirt:1,stone:1,caveStone:1,lava:1,wood:2,leaf:2,sand:2,brick:3,moss:3,glass:4,ice:3,metal:3,farmBlock:8,bedrock:99};
+const WEARABLES=['redShirt','bluePants','blackHair','whiteShoes'];
+const WEARABLE_DROP=.015;
+const PLANT_BLOCK={grassSeed:'grass',dirtSeed:'dirt',stoneSeed:'stone',woodSeed:'wood',leafSeed:'leaf',sandSeed:'sand',glassSeed:'glass',brickSeed:'brick',iceSeed:'ice',metalSeed:'metal',caveStoneSeed:'caveStone',mossSeed:'moss',farmSeed:'farmBlock'};
+const PLANT_YIELD={grassSeed:[1,3],dirtSeed:[1,4],stoneSeed:[1,2],woodSeed:[2,4],leafSeed:[1,3],sandSeed:[1,4],glassSeed:[1,2],brickSeed:[1,3],iceSeed:[1,3],metalSeed:[1,2],caveStoneSeed:[1,3],mossSeed:[1,4],farmSeed:[1,3]};
+function gemAmountForRarity(r){r=Math.max(1,Number(r||1));if(r<=10)return 1;const max=1+Math.floor((r-1)/10);return 1+Math.floor(Math.random()*max)}
+function seedRarity(seed){const block=PLANT_BLOCK[seed];return BLOCK_RARITY[block]||1}
+function seedGemChance(seed){const r=seedRarity(seed);return Math.min(.48,.08+r*.025)}
+function seedGemAmount(seed){return seed==='farmSeed'?1+crypto.randomInt(14):gemAmountForRarity(seedRarity(seed))}
+function makeDrop(tx,ty,item,amount=1,kind='item',delay=250,spread=16){return sanitizeDrop({x:tx*40+20+(Math.random()-.5)*spread,y:ty*40+20+(Math.random()-.5)*10,item,kind,amount,pickupAfter:Date.now()+delay},{serverId:true})}
+function addDrops(state,list){const added=[];for(const d of list.filter(Boolean)){if(state.snapshot.drops.length>=5000)break;state.snapshot.drops.push(d);added.push(d)}return added}
+function generateBreakDrops(blockType,tx,ty){
+  const out=[],rate=DROP_RATE[blockType]||{block:.25,seed:0,gems:.25},r=Math.random();
+  if(r<rate.block)out.push(makeDrop(tx,ty,blockType));
+  else if(rate.seed>0&&r<rate.block+rate.seed){const seed=SEED_FOR_BLOCK[blockType];if(seed)out.push(makeDrop(tx,ty,seed))}
+  else if(r<rate.block+(rate.seed||0)+WEARABLE_DROP)out.push(makeDrop(tx,ty,WEARABLES[crypto.randomInt(WEARABLES.length)]));
+  if(Math.random()<(rate.gems||.25)){const amount=blockType==='farmBlock'?1+crypto.randomInt(14):gemAmountForRarity(BLOCK_RARITY[blockType]||1);out.push(makeDrop(tx,ty,null,amount,'gems',0,12))}
+  return out;
 }
-function getOrCreateWorldState(world,clientSnapshot){
-  let state=worldStates.get(world)||loadWorldFromDb(world);
-  if(!state){state={revision:1,snapshot:sanitizeWorldSnapshot(clientSnapshot),chat:[],updatedAt:Date.now()};worldStates.set(world,state);persistWorld(world,state)}
-  return state
+function generateHarvestDrops(plant,tx,ty){
+  const seed=String(plant.seed||''),block=PLANT_BLOCK[seed]||'dirt',range=PLANT_YIELD[seed]||[1,3],amount=range[0]+crypto.randomInt(range[1]-range[0]+1),out=[];
+  for(let i=0;i<amount;i++)out.push(makeDrop(tx,ty,block,1,'item',250,20));
+  if(Math.random()<.46)out.push(makeDrop(tx,ty,seed));
+  if(Math.random()<.10)out.push(makeDrop(tx,ty,seed));
+  if(Math.random()<seedGemChance(seed))out.push(makeDrop(tx,ty,null,seedGemAmount(seed),'gems',0,12));
+  return {drops:out,amount,item:block};
 }
+
 function applyWorldAction(state,action){
-  if(!state||!action||typeof action!=='object')return false;
+  if(!state||!action||typeof action!=='object')return {accepted:false};
   const type=String(action.type||'');
-  if(type==='drop-remove'){
-    const id=String(action.dropId||'').slice(0,80);if(!id)return false;const before=state.snapshot.drops.length;state.snapshot.drops=state.snapshot.drops.filter(d=>d.id!==id);if(state.snapshot.drops.length!==before){state.revision++;state.updatedAt=Date.now()}return true
+  if(type==='drop-pickup'){
+    const id=String(action.dropId||'').slice(0,80);if(!id)return {accepted:false};const i=state.snapshot.drops.findIndex(d=>d.id===id);if(i<0)return {accepted:false};const [d]=state.snapshot.drops.splice(i,1);state.revision++;state.updatedAt=Date.now();return {accepted:true,reward:{kind:d.kind,item:d.item||null,amount:d.amount||1}}
   }
-  const tx=Math.floor(Number(action.tx)),ty=Math.floor(Number(action.ty));if(!Number.isFinite(tx)||!Number.isFinite(ty)||tx<0||ty<0||tx>=100||ty>=100)return false;
-  const px=tx*40,py=ty*40,key=(b)=>Math.floor(Number(b.x)/40)===tx&&Math.floor(Number(b.y)/40)===ty;let changed=false;
+  if(type==='drop-remove'){
+    const id=String(action.dropId||'').slice(0,80);if(!id)return {accepted:false};const before=state.snapshot.drops.length;state.snapshot.drops=state.snapshot.drops.filter(d=>d.id!==id);if(state.snapshot.drops.length===before)return {accepted:false};state.revision++;state.updatedAt=Date.now();return {accepted:true}
+  }
+  if(type==='drop-add'){
+    const d=sanitizeDrop(action.drop,{serverId:true});if(!d)return {accepted:false};const added=addDrops(state,[d]);if(!added.length)return {accepted:false};state.revision++;state.updatedAt=Date.now();return {accepted:true,dropsAdded:added}
+  }
+
+  const tx=Math.floor(Number(action.tx)),ty=Math.floor(Number(action.ty));if(!Number.isFinite(tx)||!Number.isFinite(ty)||tx<0||ty<0||tx>=100||ty>=100)return {accepted:false};
+  const px=tx*40,py=ty*40,key=(b)=>Math.floor(Number(b.x)/40)===tx&&Math.floor(Number(b.y)/40)===ty;let changed=false,dropsAdded=[],result={};
   if(type==='break'){
-    const before=state.snapshot.blocks.length;state.snapshot.blocks=state.snapshot.blocks.filter(b=>!key(b));changed=state.snapshot.blocks.length!==before
+    const i=state.snapshot.blocks.findIndex(key);if(i<0)return {accepted:false};const [removed]=state.snapshot.blocks.splice(i,1);if(removed.t==='bedrock'){state.snapshot.blocks.splice(i,0,removed);return {accepted:false}}changed=true;dropsAdded=addDrops(state,generateBreakDrops(removed.t,tx,ty));
   }else if(type==='place'){
-    const bt=String(action.blockType||'').slice(0,32);if(!bt)return false;const existing=state.snapshot.blocks.find(key);if(existing){if(existing.t!==bt)return false}else{state.snapshot.blocks.push({x:px,y:py,t:bt});changed=true}
+    const bt=String(action.blockType||'').slice(0,32);if(!bt)return {accepted:false};const existing=state.snapshot.blocks.find(key);if(existing)return {accepted:false};state.snapshot.blocks.push({x:px,y:py,t:bt});changed=true;
   }else if(type==='break-bg'){
-    const k=tx+','+ty;if(!state.snapshot.caveBgRemoved.includes(k)){state.snapshot.caveBgRemoved.push(k);changed=true}
+    const k=tx+','+ty;if(state.snapshot.caveBgRemoved.includes(k))return {accepted:false};state.snapshot.caveBgRemoved.push(k);changed=true;
+    // Cave Background always yields its farmable seed in Build 14.6.
+    dropsAdded=addDrops(state,[makeDrop(tx,ty,'caveStoneSeed',1,'item',250,14)]);
   }else if(type==='plant-upsert'){
-    const plant=sanitizePlant(action.plant,tx,ty);if(!plant)return false;const i=state.snapshot.plants.findIndex(p=>Number(p.tx)===tx&&Number(p.ty)===ty);if(i>=0)state.snapshot.plants[i]=plant;else state.snapshot.plants.push(plant);changed=true
+    const plant=sanitizePlant(action.plant,tx,ty);if(!plant)return {accepted:false};const i=state.snapshot.plants.findIndex(p=>Number(p.tx)===tx&&Number(p.ty)===ty);if(i>=0)state.snapshot.plants[i]=plant;else state.snapshot.plants.push(plant);changed=true;
   }else if(type==='plant-remove'){
-    const before=state.snapshot.plants.length;state.snapshot.plants=state.snapshot.plants.filter(p=>!(Number(p.tx)===tx&&Number(p.ty)===ty));changed=state.snapshot.plants.length!==before
-  }else if(type==='harvest'){
     const before=state.snapshot.plants.length;state.snapshot.plants=state.snapshot.plants.filter(p=>!(Number(p.tx)===tx&&Number(p.ty)===ty));changed=state.snapshot.plants.length!==before;
-    const add=Array.isArray(action.drops)?action.drops.slice(0,40).map(sanitizeDrop).filter(Boolean):[];for(const d of add)if(!state.snapshot.drops.some(x=>x.id===d.id))state.snapshot.drops.push(d);if(add.length)changed=true
-  }else return false;
-  if(changed){state.revision++;state.updatedAt=Date.now()}return true
+  }else if(type==='harvest'){
+    const i=state.snapshot.plants.findIndex(p=>Number(p.tx)===tx&&Number(p.ty)===ty);if(i<0)return {accepted:false};const [plant]=state.snapshot.plants.splice(i,1);const harvest=generateHarvestDrops(plant,tx,ty);dropsAdded=addDrops(state,harvest.drops);changed=true;result.harvestAmount=harvest.amount;result.harvestItem=harvest.item;
+  }else return {accepted:false};
+  if(changed){state.revision++;state.updatedAt=Date.now()}
+  return {accepted:changed,dropsAdded,...result};
 }
+
 function sanitizePlayerSave(input){
   if(!input||typeof input!=='object')return null;
   const inv={};for(const [k,v] of Object.entries(input.inventory||{}).slice(0,500)){const n=Math.max(0,Math.min(200,Math.floor(Number(v||0))));if(n>0)inv[String(k).slice(0,40)]=n}
   const eq={};for(const [k,v] of Object.entries(input.equipped||{}).slice(0,50))eq[String(k).slice(0,32)]=v==null?null:String(v).slice(0,40);
-  return {version:4,inventory:inv,equipped:eq,gems:Math.max(0,Math.min(999999999,Math.floor(Number(input.gems||0)))),backpackCapacity:Math.max(24,Math.min(5000,Math.floor(Number(input.backpackCapacity||24)))),backpackUpgrades:Math.max(0,Math.min(500,Math.floor(Number(input.backpackUpgrades||0)))),playerLevel:Math.max(1,Math.min(999,Math.floor(Number(input.playerLevel||1)))),playerXp:Math.max(0,Math.min(999999999,Math.floor(Number(input.playerXp||0)))),quickSlots:Array.isArray(input.quickSlots)?input.quickSlots.slice(0,3).map(v=>v?String(v).slice(0,40):null):[null,null,null],savedAt:Date.now()}
+  return {version:5,inventory:inv,equipped:eq,gems:Math.max(0,Math.min(999999999,Math.floor(Number(input.gems||0)))),backpackCapacity:Math.max(24,Math.min(5000,Math.floor(Number(input.backpackCapacity||24)))),backpackUpgrades:Math.max(0,Math.min(500,Math.floor(Number(input.backpackUpgrades||0)))),playerLevel:Math.max(1,Math.min(999,Math.floor(Number(input.playerLevel||1)))),playerXp:Math.max(0,Math.min(999999999,Math.floor(Number(input.playerXp||0)))),quickSlots:Array.isArray(input.quickSlots)?input.quickSlots.slice(0,3).map(v=>v?String(v).slice(0,40):null):[null,null,null],savedAt:Date.now()}
 }
 
 async function api(req,res){
@@ -141,6 +201,7 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
     const base=cleanName(body.name),player={playerId:'G-'+crypto.randomUUID(),displayName:`${base}_#${suffix()}`,accountType:'guest'},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
   }
@@ -161,9 +222,8 @@ async function api(req,res){
   }
 
   const auth=requireSession(req,res);if(!auth)return;const {token:t,session}=auth;
-
   if(req.url==='/api/session'){
-    const account=session.player.accountType==='account'?db.accounts[session.player.accountId]:null;return send(res,200,{token:t,player:playerPayload(session.player),playerSave:account?.playerSave||null})
+    const account=session.player.accountType==='account'?db.accounts[session.player.accountId]:null;return send(res,200,{token:t,player:playerPayload(session.player),playerSave:account?.playerSave||null,storage:storageMode})
   }
   if(req.url==='/api/player/save'){
     if(session.player.accountType!=='account')return send(res,403,{error:'ACCOUNT_REQUIRED'});const account=db.accounts[session.player.accountId];if(!account)return send(res,404,{error:'ACCOUNT_NOT_FOUND'});const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});account.playerSave=save;db.accounts[session.player.accountId]=account;saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt})
@@ -175,16 +235,16 @@ async function api(req,res){
     removePresence(session.player.playerId);sessions.delete(t);if(session.player.accountType==='account'&&activeAccountTokens.get(session.player.accountId)===t)activeAccountTokens.delete(session.player.accountId);return send(res,200,{ok:true})
   }
   if(req.url==='/api/world/join'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30)})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode})
   }
   if(req.url==='/api/world/state'){
     const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now()})
   }
   if(req.url==='/api/world/action'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,null),accepted=applyWorldAction(state,body.action);if(accepted)persistWorld(world,state);return send(res,accepted?200:409,{ok:accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(accepted?{}:{error:'ACTION_REJECTED'})})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,null),result=applyWorldAction(state,body.action);if(result.accepted)persistWorld(world,state);return send(res,result.accepted?200:409,{ok:result.accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(result.accepted?result:{error:'ACTION_REJECTED'})})
   }
   if(req.url==='/api/world/chat'){
-    const world=cleanWorld(body.world),text=String(body.text||'').trim().replace(/\s+/g,' ').slice(0,100);if(!world||!text)return send(res,400,{error:'BAD_REQUEST'});const state=getOrCreateWorldState(world,null);const msg={id:'C-'+Date.now().toString(36)+'-'+crypto.randomBytes(3).toString('hex'),playerId:session.player.playerId,name:session.player.displayName,text,at:Date.now()};state.chat=(state.chat||[]).concat(msg).slice(-30);persistWorld(world,state);return send(res,200,{ok:true,chat:state.chat})
+    const world=cleanWorld(body.world),raw=String(body.text||'').trim().replace(/\s+/g,' ');if(raw.length>120)return send(res,400,{error:'CHAT_TOO_LONG'});const text=raw.slice(0,120);if(!world||!text)return send(res,400,{error:'BAD_REQUEST'});const state=getOrCreateWorldState(world,null);const msg={id:randomId('C'),playerId:session.player.playerId,name:session.player.displayName,text,at:Date.now()};state.chat=(state.chat||[]).concat(msg).slice(-30);persistWorld(world,state);return send(res,200,{ok:true,chat:state.chat})
   }
   if(req.url==='/api/world/leave'){
     const world=cleanWorld(body.world),room=worldPresence.get(world);if(room){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(world)}return send(res,200,{ok:true})
@@ -194,7 +254,10 @@ async function api(req,res){
 
 function staticFile(req,res){
   let url=req.url.split('?')[0];if(url==='/')url='/index.html';const file=path.normalize(path.join(ROOT,url));if(!file.startsWith(ROOT))return send(res,403,{error:'FORBIDDEN'});
-  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end('Pixora Server Build 14.5 is live')}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
+  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
 }
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
-server.listen(PORT,()=>console.log(`Pixora Build 14.5 server running on port ${PORT}`));
+
+async function shutdown(){try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
+process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
+initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});

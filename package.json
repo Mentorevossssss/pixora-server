@@ -1,8 +1,11 @@
 {
   "name": "pixora-server",
-  "version": "14.5.0",
+  "version": "14.6.0",
   "private": true,
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   }
 }
