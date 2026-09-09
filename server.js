@@ -12,8 +12,15 @@ const worldPresence=new Map();
 const worldStates=new Map();
 function cleanWorld(v){return String(v||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,18)}
 function pruneRoom(world){const room=worldPresence.get(world);if(!room)return;const cutoff=Date.now()-15000;for(const [id,st] of room){if(st.lastSeen<cutoff)room.delete(id)}if(!room.size)worldPresence.delete(world)}
-function updatePresence(world,p,b){if(!worldPresence.has(world))worldPresence.set(world,new Map());const room=worldPresence.get(world),prev=room.get(p.playerId)||{};room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,lastSeen:Date.now()})}
+function updatePresence(world,p,b){if(!worldPresence.has(world))worldPresence.set(world,new Map());const room=worldPresence.get(world),prev=room.get(p.playerId)||{};room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,actionState:sanitizeActionState(b.actionState),lastSeen:Date.now()})}
 function roomView(world,selfId){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId).map(({lastSeen,...p})=>p):[]}
+function sanitizeActionState(a){
+  if(!a||typeof a!=='object'||!a.active)return {active:false};
+  const tx=Math.floor(Number(a.tx)),ty=Math.floor(Number(a.ty));
+  if(!Number.isFinite(tx)||!Number.isFinite(ty))return {active:false};
+  const kind=['block','bg','air'].includes(String(a.kind))?String(a.kind):'air';
+  return {active:true,kind,tx,ty,progress:Math.max(0,Math.min(1,Number(a.progress||0))),tool:String(a.tool||'punch').slice(0,16)};
+}
 
 
 function sanitizeWorldSnapshot(input){
@@ -77,7 +84,13 @@ function applyWorldAction(state,action){
   return true;
 }
 
-function loadDb(){try{return JSON.parse(fs.readFileSync(DB,'utf8'))}catch(_){return {accounts:{}}}}
+function sanitizePlayerSave(input){
+  if(!input||typeof input!=='object')return null;
+  const inv={};for(const [k,v] of Object.entries(input.inventory||{}).slice(0,500)){const n=Math.max(0,Math.min(200,Math.floor(Number(v||0))));if(n>0)inv[String(k).slice(0,40)]=n}
+  const eq={};for(const [k,v] of Object.entries(input.equipped||{}).slice(0,50))eq[String(k).slice(0,32)]=v==null?null:String(v).slice(0,40);
+  return {version:3,inventory:inv,equipped:eq,gems:Math.max(0,Math.min(999999999,Math.floor(Number(input.gems||0)))),backpackCapacity:Math.max(24,Math.min(5000,Math.floor(Number(input.backpackCapacity||24)))),backpackUpgrades:Math.max(0,Math.min(500,Math.floor(Number(input.backpackUpgrades||0)))),playerLevel:Math.max(1,Math.min(999,Math.floor(Number(input.playerLevel||1)))),playerXp:Math.max(0,Math.min(999999999,Math.floor(Number(input.playerXp||0)))),quickSlots:Array.isArray(input.quickSlots)?input.quickSlots.slice(0,3).map(v=>v?String(v).slice(0,40):null):[null,null,null],savedAt:Date.now()};
+}
+function loadDb(){try{const d=JSON.parse(fs.readFileSync(DB,'utf8'));if(!d.accounts)d.accounts={};return d}catch(_){return {accounts:{}}}}
 function saveDb(db){fs.writeFileSync(DB,JSON.stringify(db,null,2))}
 function cleanId(v){return String(v||'').trim().toLowerCase().replace(/[^a-z0-9_.-]/g,'').slice(0,24)}
 function cleanName(v){let s=String(v||'Player').trim().replace(/[^\p{L}\p{N}_ -]/gu,'').slice(0,12);return s||'Player'}
@@ -103,20 +116,27 @@ async function api(req,res){
     const base=cleanName(body.name);const player={playerId:'G-'+crypto.randomUUID(),displayName:`${base}_#${suffix()}`,accountType:'guest'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)});
   }
   if(req.url==='/api/register'){
-    const id=cleanId(body.id),pw=String(body.password||''),base=cleanName(body.name);
-    if(id.length<3||pw.length<6)return send(res,400,{error:'BAD_REQUEST'});
+    const rawId=String(body.id||'').trim(),id=cleanId(rawId),pw=String(body.password||'');
+    if(id.length<3||pw.length<6||rawId.length>24||!/^[A-Za-z0-9_.-]+$/.test(rawId))return send(res,400,{error:'BAD_REQUEST'});
     if(db.accounts[id])return send(res,409,{error:'ACCOUNT_EXISTS'});
-    const pass=hashPassword(pw);const account={id,playerId:'A-'+crypto.randomUUID(),displayName:base,pass,createdAt:Date.now()};db.accounts[id]=account;saveDb(db);
-    const player={playerId:account.playerId,displayName:account.displayName,accountId:id,accountType:'account'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)});
+    const pass=hashPassword(pw);const account={id,username:rawId,playerId:'A-'+crypto.randomUUID(),displayName:rawId,pass,playerSave:null,createdAt:Date.now()};db.accounts[id]=account;saveDb(db);
+    const player={playerId:account.playerId,displayName:account.username,accountId:id,accountType:'account'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:account.playerSave});
   }
   if(req.url==='/api/login'){
     const id=cleanId(body.id),pw=String(body.password||''),account=db.accounts[id];
     if(!account||!verifyPassword(pw,account.pass))return send(res,401,{error:'INVALID_CREDENTIALS'});
-    const migrated=String(account.displayName||'Player').replace(/_#\d{4}$/,'');if(migrated!==account.displayName){account.displayName=migrated;db.accounts[id]=account;saveDb(db)}
-    const player={playerId:account.playerId,displayName:account.displayName,accountId:id,accountType:'account'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)});
+    let changed=false;if(!account.username){account.username=String(account.id||id);changed=true}if(account.displayName!==account.username){account.displayName=account.username;changed=true}if(!('playerSave' in account)){account.playerSave=null;changed=true}if(changed){db.accounts[id]=account;saveDb(db)}
+    const player={playerId:account.playerId,displayName:account.username,accountId:id,accountType:'account'};const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:account.playerSave||null});
   }
   if(req.url==='/api/session'){
-    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});return send(res,200,{token:t,player:playerPayload(session.player)});
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});const account=session.player.accountType==='account'?db.accounts[session.player.accountId]:null;return send(res,200,{token:t,player:playerPayload(session.player),playerSave:account?.playerSave||null});
+  }
+  if(req.url==='/api/player/save'){
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});if(session.player.accountType!=='account')return send(res,403,{error:'ACCOUNT_REQUIRED'});
+    const account=db.accounts[session.player.accountId];if(!account)return send(res,404,{error:'ACCOUNT_NOT_FOUND'});const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});account.playerSave=save;db.accounts[session.player.accountId]=account;saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt});
+  }
+  if(req.url==='/api/player/load'){
+    const t=authToken(req),session=sessions.get(t);if(!session)return send(res,401,{error:'INVALID_SESSION'});if(session.player.accountType!=='account')return send(res,403,{error:'ACCOUNT_REQUIRED'});const account=db.accounts[session.player.accountId];return send(res,200,{ok:true,playerSave:account?.playerSave||null});
   }
   if(req.url==='/api/logout'){
     const t=authToken(req),session=sessions.get(t);if(session){for(const [world,room] of worldPresence){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(world)}}if(t)sessions.delete(t);return send(res,200,{ok:true});
@@ -143,4 +163,4 @@ function staticFile(req,res){
 }
 
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
-server.listen(PORT,()=>console.log(`Pixora Build 14.3 multiplayer world server running on http://localhost:${PORT}`));
+server.listen(PORT,()=>console.log(`Pixora Build 14.4 multiplayer + cloud account server running on http://localhost:${PORT}`));
