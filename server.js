@@ -16,6 +16,9 @@ const revokedTokens=new Map();
 const activeAccountTokens=new Map();
 const worldPresence=new Map();
 const worldStates=new Map();
+const knockbackEvents=new Map();
+const MAX_SERVER_PLAYERS=100;
+const MAX_WORLD_PLAYERS=20;
 
 let dbCache={accounts:{},worlds:{}};
 let pgPool=null;
@@ -25,6 +28,8 @@ let persistQueue=Promise.resolve();
 function cleanWorld(v){return String(v||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,18)}
 function cleanId(v){return String(v||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,24)}
 function cleanName(v){let s=String(v||'Player').trim().replace(/[^\p{L}\p{N}_ -]/gu,'').slice(0,12);return s||'Player'}
+function cleanGuestId(v){return String(v||'').replace(/[^A-Za-z0-9_-]/g,'').slice(0,64)}
+function guestSuffix(id){const n=parseInt(crypto.createHash('sha256').update(String(id)).digest('hex').slice(0,8),16);return String(1000+(n%9000))}
 function suffix(){return String(1000+crypto.randomInt(9000))}
 function token(){return crypto.randomBytes(32).toString('hex')}
 function randomId(prefix='D'){return `${prefix}-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`}
@@ -94,12 +99,18 @@ function sanitizeActionState(a){
   const kind=['block','bg','air'].includes(String(a.kind))?String(a.kind):'air';
   return {active:true,kind,tx,ty,progress:Math.max(0,Math.min(1,Number(a.progress||0))),tool:String(a.tool||'punch').slice(0,16),seq:Math.max(0,Math.floor(Number(a.seq||0)))}
 }
+function sanitizePresenceEquipment(e){const src=(e&&typeof e==='object')?e:{};const out={};for(const k of ['hair','shirt','pants','shoes','back','tool'])out[k]=src[k]==null?null:String(src[k]).slice(0,40);return out}
 function updatePresence(world,p,b){
   if(!worldPresence.has(world))worldPresence.set(world,new Map());
   const room=worldPresence.get(world),prev=room.get(p.playerId)||{};
-  room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,actionState:sanitizeActionState(b.actionState),lastSeen:Date.now()})
+  room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,equipped:sanitizePresenceEquipment(b.equipped||prev.equipped),actionState:sanitizeActionState(b.actionState),lastSeen:Date.now()})
 }
 function roomView(world,selfId){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId).map(({lastSeen,...p})=>p):[]}
+function activePresenceIds(){const ids=new Set();for(const [w] of worldPresence){pruneRoom(w);const room=worldPresence.get(w);if(room)for(const id of room.keys())ids.add(id)}return ids}
+function canJoinWorld(world,playerId){pruneRoom(world);const room=worldPresence.get(world);if(room?.has(playerId))return {ok:true};if((room?.size||0)>=MAX_WORLD_PLAYERS)return {ok:false,error:'WORLD_FULL'};if(activePresenceIds().size>=MAX_SERVER_PLAYERS)return {ok:false,error:'SERVER_FULL'};return {ok:true}}
+function tileOccupiedByPlayer(world,tx,ty){pruneRoom(world);const room=worldPresence.get(world);if(!room)return false;const x=tx*40,y=ty*40;for(const p of room.values()){const px=Number(p.x||0),py=Number(p.y||0);if(px< x+40&&px+30>x&&py<y+40&&py+40>y)return true}return false}
+function queueKnockback(playerId,ev){const q=knockbackEvents.get(playerId)||[];q.push(ev);knockbackEvents.set(playerId,q.slice(-8))}
+function consumeEvents(playerId){const q=knockbackEvents.get(playerId)||[];knockbackEvents.delete(playerId);return q}
 
 function sanitizeDrop(d,{serverId=false}={}){
   if(!d||typeof d!=='object')return null;
@@ -109,9 +120,10 @@ function sanitizeDrop(d,{serverId=false}={}){
 }
 function sanitizeWorldSnapshot(input){
   const s=(input&&typeof input==='object')?input:{};
+  const jammers=Array.isArray(s.jammers)?s.jammers.slice(0,50).filter(j=>j&&Number.isFinite(Number(j.tx))&&Number.isFinite(Number(j.ty))&&String(j.type||'')==='punch').map(j=>({tx:Math.floor(Number(j.tx)),ty:Math.floor(Number(j.ty)),type:'punch',owner:String(j.owner||'').slice(0,80)})):[];
   const blocks=Array.isArray(s.blocks)?s.blocks.slice(0,20000).filter(b=>b&&Number.isFinite(Number(b.x))&&Number.isFinite(Number(b.y))&&typeof b.t==='string').map(b=>({x:Number(b.x),y:Number(b.y),t:String(b.t).slice(0,32)})):[];
   const door=(s.door&&Number.isFinite(Number(s.door.x))&&Number.isFinite(Number(s.door.y)))?{x:Number(s.door.x),y:Number(s.door.y),w:Number(s.door.w)||36,h:Number(s.door.h)||40}:null;
-  return {worldId:String(s.worldId||'').slice(0,64),surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,blocks,door,caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],plants:Array.isArray(s.plants)?s.plants.slice(0,5000):[],locks:Array.isArray(s.locks)?s.locks.slice(0,1000):[],weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},drops:Array.isArray(s.drops)?s.drops.slice(0,5000).map(sanitizeDrop).filter(Boolean):[]}
+  return {worldId:String(s.worldId||'').slice(0,64),surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,blocks,door,caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],plants:Array.isArray(s.plants)?s.plants.slice(0,5000):[],locks:Array.isArray(s.locks)?s.locks.slice(0,1000):[],weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],jammers,weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},drops:Array.isArray(s.drops)?s.drops.slice(0,5000).map(sanitizeDrop).filter(Boolean):[]}
 }
 function sanitizePlant(p,tx,ty){
   if(!p||typeof p!=='object')return null;const seed=String(p.seed||'').slice(0,40);if(!seed)return null;
@@ -138,10 +150,8 @@ function seedGemAmount(seed){return seed==='farmSeed'?1+crypto.randomInt(14):gem
 function makeDrop(tx,ty,item,amount=1,kind='item',delay=250,spread=16){return sanitizeDrop({x:tx*40+20+(Math.random()-.5)*spread,y:ty*40+20+(Math.random()-.5)*10,item,kind,amount,pickupAfter:Date.now()+delay},{serverId:true})}
 function addDrops(state,list){const added=[];for(const d of list.filter(Boolean)){if(state.snapshot.drops.length>=5000)break;state.snapshot.drops.push(d);added.push(d)}return added}
 function generateBreakDrops(blockType,tx,ty){
-  const out=[],rate=DROP_RATE[blockType]||{block:.25,seed:0,gems:.25},r=Math.random();
-  if(r<rate.block)out.push(makeDrop(tx,ty,blockType));
-  else if(rate.seed>0&&r<rate.block+rate.seed){const seed=SEED_FOR_BLOCK[blockType];if(seed)out.push(makeDrop(tx,ty,seed))}
-  else if(r<rate.block+(rate.seed||0)+WEARABLE_DROP)out.push(makeDrop(tx,ty,WEARABLES[crypto.randomInt(WEARABLES.length)]));
+  // Build 14.6.2: block/seed/clothes tidak lagi jatuh dari break. Gems tetap menjadi reward farming + mata uang Store.
+  const out=[],rate=DROP_RATE[blockType]||{gems:.25};
   if(Math.random()<(rate.gems||.25)){const amount=blockType==='farmBlock'?1+crypto.randomInt(14):gemAmountForRarity(BLOCK_RARITY[blockType]||1);out.push(makeDrop(tx,ty,null,amount,'gems',0,12))}
   return out;
 }
@@ -154,9 +164,18 @@ function generateHarvestDrops(plant,tx,ty){
   return {drops:out,amount,item:block};
 }
 
-function applyWorldAction(state,action){
+function applyWorldAction(state,action,session,world){
   if(!state||!action||typeof action!=='object')return {accepted:false};
   const type=String(action.type||'');
+  if(type==='player-punch'){
+    const sourceId=session?.player?.playerId,targetId=String(action.targetPlayerId||'').slice(0,80),room=worldPresence.get(world);
+    if(!sourceId||!targetId||targetId===sourceId||!room)return {accepted:false};pruneRoom(world);
+    const src=room.get(sourceId),target=room.get(targetId);if(!src||!target)return {accepted:false};
+    if(Array.isArray(state.snapshot.jammers)&&state.snapshot.jammers.some(j=>j?.type==='punch'))return {accepted:true,blocked:true};
+    const sx=Number(src.x||0)+15,sy=Number(src.y||0)+20,txp=Number(target.x||0)+15,typ=Number(target.y||0)+20,dx=txp-sx,dy=Math.abs(typ-sy),facing=Number(src.facing)<0?-1:1;
+    if(Math.sign(dx||facing)!==facing||Math.abs(dx)>98||dy>42)return {accepted:false};
+    queueKnockback(targetId,{type:'knockback',vx:facing*4.8,vy:-5.8,from:sourceId,at:Date.now()});return {accepted:true,knockback:true,targetId};
+  }
   if(type==='drop-pickup'){
     const id=String(action.dropId||'').slice(0,80);if(!id)return {accepted:false};const i=state.snapshot.drops.findIndex(d=>d.id===id);if(i<0)return {accepted:false};const [d]=state.snapshot.drops.splice(i,1);state.revision++;state.updatedAt=Date.now();return {accepted:true,reward:{kind:d.kind,item:d.item||null,amount:d.amount||1}}
   }
@@ -172,7 +191,11 @@ function applyWorldAction(state,action){
   if(type==='break'){
     const i=state.snapshot.blocks.findIndex(key);if(i<0)return {accepted:false};const [removed]=state.snapshot.blocks.splice(i,1);if(removed.t==='bedrock'){state.snapshot.blocks.splice(i,0,removed);return {accepted:false}}changed=true;dropsAdded=addDrops(state,generateBreakDrops(removed.t,tx,ty));
   }else if(type==='place'){
-    const bt=String(action.blockType||'').slice(0,32);if(!bt)return {accepted:false};const existing=state.snapshot.blocks.find(key);if(existing)return {accepted:false};state.snapshot.blocks.push({x:px,y:py,t:bt});changed=true;
+    const bt=String(action.blockType||'').slice(0,32);if(!bt)return {accepted:false};const existing=state.snapshot.blocks.find(key);if(existing||tileOccupiedByPlayer(world,tx,ty)||state.snapshot.jammers.some(j=>Number(j.tx)===tx&&Number(j.ty)===ty)||state.snapshot.plants.some(p=>Number(p.tx)===tx&&Number(p.ty)===ty)||state.snapshot.locks.some(l=>Number(l.tx)===tx&&Number(l.ty)===ty)||state.snapshot.weatherOrbs.some(o=>Number(o.tx)===tx&&Number(o.ty)===ty))return {accepted:false};state.snapshot.blocks.push({x:px,y:py,t:bt});changed=true;
+  }else if(type==='jammer-place'){
+    if(tileOccupiedByPlayer(world,tx,ty)||state.snapshot.blocks.some(key)||state.snapshot.jammers.some(j=>Number(j.tx)===tx&&Number(j.ty)===ty)||state.snapshot.plants.some(p=>Number(p.tx)===tx&&Number(p.ty)===ty)||state.snapshot.locks.some(l=>Number(l.tx)===tx&&Number(l.ty)===ty)||state.snapshot.weatherOrbs.some(o=>Number(o.tx)===tx&&Number(o.ty)===ty))return {accepted:false};state.snapshot.jammers.push({tx,ty,type:'punch',owner:session?.player?.playerId||''});changed=true;
+  }else if(type==='jammer-remove'){
+    const i=state.snapshot.jammers.findIndex(j=>Number(j.tx)===tx&&Number(j.ty)===ty&&j.type==='punch');if(i<0)return {accepted:false};const j=state.snapshot.jammers[i];if(j.owner&&j.owner!==session?.player?.playerId)return {accepted:false};state.snapshot.jammers.splice(i,1);changed=true;
   }else if(type==='break-bg'){
     const k=tx+','+ty;if(state.snapshot.caveBgRemoved.includes(k))return {accepted:false};state.snapshot.caveBgRemoved.push(k);changed=true;
     // Cave Background always yields its farmable seed in Build 14.6.
@@ -201,9 +224,9 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6.1',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6.2',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
-    const base=cleanName(body.name),player={playerId:'G-'+crypto.randomUUID(),displayName:`${base}_#${suffix()}`,accountType:'guest'},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
+    const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),player={playerId:'G-'+guestId,displayName:`${base}_#${guestSuffix(guestId)}`,accountType:'guest'},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
   }
   if(req.url==='/api/register'){
     const rawId=String(body.id||'').trim(),id=cleanId(rawId),pw=String(body.password||'');
@@ -235,13 +258,13 @@ async function api(req,res){
     removePresence(session.player.playerId);sessions.delete(t);if(session.player.accountType==='account'&&activeAccountTokens.get(session.player.accountId)===t)activeAccountTokens.delete(session.player.accountId);return send(res,200,{ok:true})
   }
   if(req.url==='/api/world/join'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),events:consumeEvents(session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode})
   }
   if(req.url==='/api/world/state'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now()})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);const state=getOrCreateWorldState(world,body.worldSnapshot);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),events:consumeEvents(session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now()})
   }
   if(req.url==='/api/world/action'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,null),result=applyWorldAction(state,body.action);if(result.accepted)persistWorld(world,state);return send(res,result.accepted?200:409,{ok:result.accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(result.accepted?result:{error:'ACTION_REJECTED'})})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,null),result=applyWorldAction(state,body.action,session,world);if(result.accepted&&(result.knockback!==true&&result.blocked!==true))persistWorld(world,state);return send(res,result.accepted?200:409,{ok:result.accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(result.accepted?result:{error:'ACTION_REJECTED'})})
   }
   if(req.url==='/api/world/chat'){
     const world=cleanWorld(body.world),raw=String(body.text||'').trim().replace(/\s+/g,' ');if(raw.length>120)return send(res,400,{error:'CHAT_TOO_LONG'});const text=raw.slice(0,120);if(!world||!text)return send(res,400,{error:'BAD_REQUEST'});const state=getOrCreateWorldState(world,null);const msg={id:randomId('C'),playerId:session.player.playerId,name:session.player.displayName,text,at:Date.now()};state.chat=(state.chat||[]).concat(msg).slice(-30);persistWorld(world,state);return send(res,200,{ok:true,chat:state.chat})
@@ -254,10 +277,10 @@ async function api(req,res){
 
 function staticFile(req,res){
   let url=req.url.split('?')[0];if(url==='/')url='/index.html';const file=path.normalize(path.join(ROOT,url));if(!file.startsWith(ROOT))return send(res,403,{error:'FORBIDDEN'});
-  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6.1 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
+  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6.2 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
 }
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
 
 async function shutdown(){try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
-initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6.1 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6.2 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
