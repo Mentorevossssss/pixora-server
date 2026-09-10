@@ -139,8 +139,6 @@ function getOrCreateWorldState(world,clientSnapshot){let state=worldStates.get(w
 const DROP_RATE={grass:{block:.42,seed:.30,gems:.28},dirt:{block:.38,seed:.20,gems:.24},stone:{block:.32,seed:.08,gems:.34},wood:{block:.45,seed:.24,gems:.25},leaf:{block:.24,seed:.42,gems:.22},sand:{block:.40,seed:.18,gems:.22},glass:{block:.31,seed:.12,gems:.38},brick:{block:.36,seed:.12,gems:.32},ice:{block:.34,seed:.22,gems:.30},metal:{block:.28,seed:.06,gems:.46},caveStone:{block:.32,seed:.10,gems:.40},moss:{block:.36,seed:.34,gems:.24},lava:{block:.22,seed:0,gems:.44},farmBlock:{block:.46,seed:.34,gems:.38}};
 const SEED_FOR_BLOCK={grass:'grassSeed',dirt:'dirtSeed',stone:'stoneSeed',wood:'woodSeed',leaf:'leafSeed',sand:'sandSeed',glass:'glassSeed',brick:'brickSeed',ice:'iceSeed',metal:'metalSeed',caveStone:'caveStoneSeed',moss:'mossSeed',farmBlock:'farmSeed'};
 const BLOCK_RARITY={grass:1,dirt:1,stone:1,caveStone:1,lava:1,wood:2,leaf:2,sand:2,brick:3,moss:3,glass:4,ice:3,metal:3,farmBlock:8,bedrock:99};
-const WEARABLES=['redShirt','bluePants','blackHair','whiteShoes'];
-const WEARABLE_DROP=.015;
 const PLANT_BLOCK={grassSeed:'grass',dirtSeed:'dirt',stoneSeed:'stone',woodSeed:'wood',leafSeed:'leaf',sandSeed:'sand',glassSeed:'glass',brickSeed:'brick',iceSeed:'ice',metalSeed:'metal',caveStoneSeed:'caveStone',mossSeed:'moss',farmSeed:'farmBlock'};
 const PLANT_YIELD={grassSeed:[1,3],dirtSeed:[1,4],stoneSeed:[1,2],woodSeed:[2,4],leafSeed:[1,3],sandSeed:[1,4],glassSeed:[1,2],brickSeed:[1,3],iceSeed:[1,3],metalSeed:[1,2],caveStoneSeed:[1,3],mossSeed:[1,4],farmSeed:[1,3]};
 function gemAmountForRarity(r){r=Math.max(1,Number(r||1));if(r<=10)return 1;const max=1+Math.floor((r-1)/10);return 1+Math.floor(Math.random()*max)}
@@ -150,8 +148,10 @@ function seedGemAmount(seed){return seed==='farmSeed'?1+crypto.randomInt(14):gem
 function makeDrop(tx,ty,item,amount=1,kind='item',delay=250,spread=16){return sanitizeDrop({x:tx*40+20+(Math.random()-.5)*spread,y:ty*40+20+(Math.random()-.5)*10,item,kind,amount,pickupAfter:Date.now()+delay},{serverId:true})}
 function addDrops(state,list){const added=[];for(const d of list.filter(Boolean)){if(state.snapshot.drops.length>=5000)break;state.snapshot.drops.push(d);added.push(d)}return added}
 function generateBreakDrops(blockType,tx,ty){
-  // Build 14.6.2: block/seed/clothes tidak lagi jatuh dari break. Gems tetap menjadi reward farming + mata uang Store.
-  const out=[],rate=DROP_RATE[blockType]||{gems:.25};
+  // Build 14.6.3: Block + Seed kembali memakai drop-rate farming lama. Clothes/Wearable tetap Store-only.
+  const out=[],rate=DROP_RATE[blockType]||{block:.25,seed:0,gems:.25},r=Math.random();
+  if(r<rate.block)out.push(makeDrop(tx,ty,blockType));
+  else if(rate.seed>0&&r<rate.block+rate.seed){const seed=SEED_FOR_BLOCK[blockType];if(seed)out.push(makeDrop(tx,ty,seed))}
   if(Math.random()<(rate.gems||.25)){const amount=blockType==='farmBlock'?1+crypto.randomInt(14):gemAmountForRarity(BLOCK_RARITY[blockType]||1);out.push(makeDrop(tx,ty,null,amount,'gems',0,12))}
   return out;
 }
@@ -224,7 +224,7 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6.2',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6.3',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
     const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),player={playerId:'G-'+guestId,displayName:`${base}_#${guestSuffix(guestId)}`,accountType:'guest'},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
   }
@@ -277,10 +277,10 @@ async function api(req,res){
 
 function staticFile(req,res){
   let url=req.url.split('?')[0];if(url==='/')url='/index.html';const file=path.normalize(path.join(ROOT,url));if(!file.startsWith(ROOT))return send(res,403,{error:'FORBIDDEN'});
-  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6.2 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
+  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6.3 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
 }
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
 
 async function shutdown(){try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
-initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6.2 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6.3 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
