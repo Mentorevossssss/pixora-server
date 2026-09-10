@@ -21,6 +21,8 @@ const trades=new Map();
 const tradeByPlayer=new Map();
 const MAX_SERVER_PLAYERS=100;
 const MAX_WORLD_PLAYERS=20;
+const HELL_WORLD='HELL';
+const ROLE_RANK={Player:0,Moderator:1,Admin:2,Owner:3};
 
 let dbCache={accounts:{},worlds:{}};
 let pgPool=null;
@@ -39,7 +41,7 @@ function hashPassword(password,salt=crypto.randomBytes(16).toString('hex')){retu
 function verifyPassword(password,stored){
   try{const got=hashPassword(password,stored.salt).hash;return crypto.timingSafeEqual(Buffer.from(got,'hex'),Buffer.from(stored.hash,'hex'))}catch(_){return false}
 }
-function normalizeDb(d){if(!d||typeof d!=='object')d={};if(!d.accounts||typeof d.accounts!=='object')d.accounts={};if(!d.worlds||typeof d.worlds!=='object')d.worlds={};if(!Array.isArray(d.reports))d.reports=[];return d}
+function normalizeDb(d){if(!d||typeof d!=='object')d={};if(!d.accounts||typeof d.accounts!=='object')d.accounts={};if(!d.worlds||typeof d.worlds!=='object')d.worlds={};if(!Array.isArray(d.reports))d.reports=[];if(!Array.isArray(d.auditLog))d.auditLog=[];if(!d.serverBans||typeof d.serverBans!=='object')d.serverBans={};if(!d.hellJail||typeof d.hellJail!=='object')d.hellJail={};return d}
 const BUILTIN_OWNER_ACCOUNT={id:'williamx',username:'WilliamX',playerId:'A-1fb8e9b4-6bd5-45fd-8f0a-d09355a4658e',displayName:'WilliamX',email:'',role:'Owner',pass:{salt:'2b0079e1e5a4fafc7d7d524d1edb63bf',hash:'374b741dd8b46cd1a00cdff94bb3280379f892128869551104dd92f9481a290ae726351fb0acc77b8d6cfddeaf743668a451ebf648edc1415b14f0e7dfbe83af'},playerSave:null,createdAt:1789017712504,builtInOwner:true};
 function ensureBuiltInOwner(db){
   db=normalizeDb(db);let changed=false;
@@ -96,6 +98,44 @@ function authToken(req){const h=String(req.headers.authorization||'');return h.s
 function playerPayload(p){return {playerId:p.playerId,displayName:p.displayName,accountId:p.accountId||null,accountType:p.accountType,role:p.role||'Player'}}
 const OWNER_ACCOUNT_ID=cleanId(process.env.PIXORA_OWNER_ID||'');
 function roleForAccount(account){if(!account)return 'Player';if(OWNER_ACCOUNT_ID&&account.id===OWNER_ACCOUNT_ID)return 'Owner';return ['Player','Moderator','Admin','Owner'].includes(account.role)?account.role:'Player'}
+function roleRank(role){return ROLE_RANK[String(role||'Player')]??0}
+function hasRole(role,minRole){return roleRank(role)>=roleRank(minRole)}
+function canStaffTarget(actor,target){return !!actor&&!!target&&actor.playerId!==target.playerId&&roleRank(target.role)<roleRank(actor.role)}
+function addAudit(db,actor,action,target='',details={}){db.auditLog.push({id:randomId('AUD'),at:Date.now(),actorId:actor?.playerId||'',actorName:actor?.displayName||'',actorRole:actor?.role||'Player',action:String(action||'').slice(0,40),target:String(target||'').slice(0,100),details});db.auditLog=db.auditLog.slice(-2000)}
+function resolveWorldTarget(world,query){pruneRoom(world);const room=worldPresence.get(world);if(!room)return {error:'PLAYER_NOT_FOUND'};const q=String(query||'').trim().toLowerCase();if(!q)return {error:'PLAYER_NOT_FOUND'};let exact=[...room.values()].filter(p=>String(p.playerId).toLowerCase()===q||String(p.displayName).toLowerCase()===q);if(exact.length===1)return {player:exact[0]};let partial=[...room.values()].filter(p=>String(p.displayName).toLowerCase().startsWith(q));if(partial.length===1)return {player:partial[0]};return {error:partial.length>1?'PLAYER_AMBIGUOUS':'PLAYER_NOT_FOUND'}}
+function resolveAnyKnownPlayer(db,query){const q=String(query||'').trim().toLowerCase();if(!q)return null;for(const a of Object.values(db.accounts||{})){if(String(a.playerId||'').toLowerCase()===q||String(a.id||'').toLowerCase()===q||String(a.username||'').toLowerCase()===q)return {playerId:a.playerId,displayName:a.username||a.displayName||a.id,role:roleForAccount(a),account:a}}return null}
+function staffHelp(role){const out=['/help','/who','/warp <world>'];if(hasRole(role,'Moderator'))out.push('/pull <player>','/kick <player>');if(hasRole(role,'Admin'))out.push('/ban <player> [reason]','/unban <id/player>','/give <item> [amount] [player]');if(role==='Owner')out.push('/hell <player> [reason]','/unhell <id/player>','/vanish','/unvanish','/staff [on|off]','/audit [jumlah]');return out}
+function commandError(message){return {ok:false,message}}
+function runChatCommand({raw,world,session,db}){
+  const parts=String(raw||'').trim().slice(1).split(/\s+/),cmd=String(parts.shift()||'').toLowerCase(),role=session.player.role||'Player',pid=session.player.playerId;
+  const room=worldPresence.get(world);pruneRoom(world);
+  const ok=(message,extra={})=>({ok:true,message,...extra});
+  if(cmd==='help')return ok('Commands: '+staffHelp(role).join(' • '));
+  if(cmd==='who'){const visible=room?[...room.values()].filter(p=>!p.vanished||hasRole(role,'Moderator')):[];return ok('Online di '+world+': '+(visible.map(p=>p.displayName+(p.role&&p.role!=='Player'?' ['+p.role+']':'')).join(', ')||'hanya kamu'))}
+  if(cmd==='warp'){const dest=cleanWorld(parts[0]);if(!dest)return commandError('Pakai: /warp <world>');if(db.hellJail[pid]&&dest!==HELL_WORLD)return commandError('Kamu sedang dikunci di HELL.');return ok('Warp ke '+dest,{teleportWorld:dest})}
+  if(cmd==='pull'||cmd==='kick'){
+    if(!hasRole(role,'Moderator'))return commandError('Moderator+ required.');const r=resolveWorldTarget(world,parts[0]);if(!r.player)return commandError(r.error==='PLAYER_AMBIGUOUS'?'Nama player ambigu.':'Player tidak ditemukan.');if(!canStaffTarget(session.player,r.player))return commandError('Tidak bisa memakai command pada role yang sama/lebih tinggi.');
+    if(cmd==='pull'){const src=room?.get(pid);queueEvent(r.player.playerId,{type:'pull',world,x:Number(src?.x||0),y:Number(src?.y||0)-44,from:pid,staff:true});addAudit(db,session.player,'pull',r.player.playerId,{world});saveDb(db);return ok('Pulled '+r.player.displayName)}
+    queueEvent(r.player.playerId,{type:'world-kick',world,reason:'STAFF_KICK',from:pid});addAudit(db,session.player,'kick',r.player.playerId,{world});saveDb(db);return ok('Kicked '+r.player.displayName)
+  }
+  if(cmd==='ban'){
+    if(!hasRole(role,'Admin'))return commandError('Admin+ required.');const r=resolveWorldTarget(world,parts[0]);if(!r.player)return commandError(r.error==='PLAYER_AMBIGUOUS'?'Nama player ambigu.':'Player harus online di world ini.');if(!canStaffTarget(session.player,r.player))return commandError('Tidak bisa ban role yang sama/lebih tinggi.');const reason=parts.slice(1).join(' ').slice(0,160)||'Staff ban';db.serverBans[r.player.playerId]={at:Date.now(),by:pid,byName:session.player.displayName,reason};addAudit(db,session.player,'server-ban',r.player.playerId,{reason,world});saveDb(db);removePresence(r.player.playerId);return ok('Server banned '+r.player.displayName)}
+  if(cmd==='unban'){
+    if(!hasRole(role,'Admin'))return commandError('Admin+ required.');const known=resolveAnyKnownPlayer(db,parts[0]);let targetId=known?.playerId||String(parts[0]||'');if(!db.serverBans[targetId]){const hit=Object.keys(db.serverBans).find(x=>x.toLowerCase()===targetId.toLowerCase());if(hit)targetId=hit}if(!db.serverBans[targetId])return commandError('Ban tidak ditemukan.');delete db.serverBans[targetId];addAudit(db,session.player,'server-unban',targetId,{});saveDb(db);return ok('Unbanned '+(known?.displayName||targetId))}
+  if(cmd==='give'){
+    if(!hasRole(role,'Admin'))return commandError('Admin+ required.');const item=String(parts[0]||'').slice(0,40),amount=Math.max(1,Math.min(200,Math.floor(Number(parts[1]||1))));let target=session.player;if(parts[2]){const r=resolveWorldTarget(world,parts[2]);if(!r.player)return commandError('Target player tidak ditemukan.');if(role!=='Owner'&&!canStaffTarget(session.player,r.player)&&r.player.playerId!==pid)return commandError('Target role terlalu tinggi.');target=r.player}const acc=accountByPlayerId(db,target.playerId);if(!item)return commandError('Pakai: /give <item> [amount] [player]');if(!acc?.playerSave)return commandError('Target harus akun permanen dengan save server.');const inv=acc.playerSave.inventory||{};inv[item]=Math.min(200,Number(inv[item]||0)+amount);acc.playerSave.inventory=inv;saveDb(db);const live=sessionByPlayerId(target.playerId)?.session;if(live)queueEvent(target.playerId,{type:'staff-save-refresh',playerSave:acc.playerSave});addAudit(db,session.player,'give',target.playerId,{item,amount});saveDb(db);return ok('Gave '+amount+' '+item+' to '+target.displayName)}
+  if(cmd==='hell'){
+    if(role!=='Owner')return commandError('Owner required.');const r=resolveWorldTarget(world,parts[0]);if(!r.player)return commandError('Player harus online di world ini.');if(!canStaffTarget(session.player,r.player))return commandError('Tidak bisa mengirim role yang sama/lebih tinggi ke HELL.');const reason=parts.slice(1).join(' ').slice(0,160)||'Owner punishment';db.hellJail[r.player.playerId]={at:Date.now(),by:pid,reason};addAudit(db,session.player,'hell',r.player.playerId,{reason});saveDb(db);queueEvent(r.player.playerId,{type:'staff-warp',world:HELL_WORLD,reason:'HELL'});return ok('Sent '+r.player.displayName+' to HELL')}
+  if(cmd==='unhell'){
+    if(role!=='Owner')return commandError('Owner required.');const known=resolveAnyKnownPlayer(db,parts[0]);let targetId=known?.playerId||String(parts[0]||'');if(!db.hellJail[targetId]){const hit=Object.keys(db.hellJail).find(x=>x.toLowerCase()===targetId.toLowerCase());if(hit)targetId=hit}if(!db.hellJail[targetId])return commandError('Player tidak sedang di HELL.');delete db.hellJail[targetId];addAudit(db,session.player,'unhell',targetId,{});saveDb(db);return ok('Released '+(known?.displayName||targetId)+' from HELL')}
+  if(cmd==='vanish'||cmd==='unvanish'){
+    if(role!=='Owner')return commandError('Owner required.');const on=cmd==='vanish';session.player.vanished=on;const p=room?.get(pid);if(p)p.vanished=on;addAudit(db,session.player,on?'vanish':'unvanish',pid,{});saveDb(db);return ok(on?'Vanish ON':'Vanish OFF',{vanished:on})}
+  if(cmd==='staff'){
+    if(role!=='Owner')return commandError('Owner required.');const arg=String(parts[0]||'').toLowerCase();const on=arg==='on'?true:arg==='off'?false:!session.player.staffMode;session.player.staffMode=on;const p=room?.get(pid);if(p)p.staffMode=on;addAudit(db,session.player,'staff-mode',pid,{enabled:on});saveDb(db);return ok(on?'Staff Mode ON • fly/noclip aktif':'Staff Mode OFF',{staffMode:on})}
+  if(cmd==='audit'){
+    if(role!=='Owner')return commandError('Owner required.');const n=Math.max(1,Math.min(10,Math.floor(Number(parts[0]||5))));const rows=(db.auditLog||[]).slice(-n).reverse().map(a=>a.actorName+' '+a.action+(a.target?' → '+a.target:'')).join(' | ');return ok(rows||'Audit log kosong.')}
+  return commandError('Command tidak dikenal. Pakai /help.')
+}
 function accountByPlayerId(db,playerId){return Object.values(db.accounts||{}).find(a=>a&&a.playerId===playerId)||null}
 function sessionByPlayerId(playerId){for(const [t,s] of sessions){if(s?.player?.playerId===playerId)return {token:t,session:s}}return null}
 function queueEvent(playerId,ev){const q=knockbackEvents.get(playerId)||[];q.push(ev);knockbackEvents.set(playerId,q.slice(-20))}
@@ -133,12 +173,12 @@ function sanitizePresenceEquipment(e){const src=(e&&typeof e==='object')?e:{};co
 function updatePresence(world,p,b){
   if(!worldPresence.has(world))worldPresence.set(world,new Map());
   const room=worldPresence.get(world),prev=room.get(p.playerId)||{};
-  room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,role:p.role||'Player',accountType:p.accountType||'guest',x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,equipped:sanitizePresenceEquipment(b.equipped||prev.equipped),actionState:sanitizeActionState(b.actionState),lastSeen:Date.now()})
+  room.set(p.playerId,{playerId:p.playerId,displayName:p.displayName,role:p.role||'Player',accountType:p.accountType||'guest',vanished:!!p.vanished,staffMode:!!p.staffMode,x:Number.isFinite(Number(b.x))?Number(b.x):(prev.x||120),y:Number.isFinite(Number(b.y))?Number(b.y):(prev.y||0),facing:Number(b.facing)<0?-1:1,onGround:!!b.onGround,vx:Number.isFinite(Number(b.vx))?Number(b.vx):0,vy:Number.isFinite(Number(b.vy))?Number(b.vy):0,equipped:sanitizePresenceEquipment(b.equipped||prev.equipped),actionState:sanitizeActionState(b.actionState),lastSeen:Date.now()})
 }
-function roomView(world,selfId){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId).map(({lastSeen,...p})=>p):[]}
+function roomView(world,selfId,viewerRole='Player'){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId&&(!p.vanished||hasRole(viewerRole,'Moderator'))).map(({lastSeen,vanished,staffMode,...p})=>p):[]}
 function activePresenceIds(){const ids=new Set();for(const [w] of worldPresence){pruneRoom(w);const room=worldPresence.get(w);if(room)for(const id of room.keys())ids.add(id)}return ids}
 function canJoinWorld(world,playerId){pruneRoom(world);const room=worldPresence.get(world);if(room?.has(playerId))return {ok:true};if((room?.size||0)>=MAX_WORLD_PLAYERS)return {ok:false,error:'WORLD_FULL'};if(activePresenceIds().size>=MAX_SERVER_PLAYERS)return {ok:false,error:'SERVER_FULL'};return {ok:true}}
-function tileOccupiedByPlayer(world,tx,ty){pruneRoom(world);const room=worldPresence.get(world);if(!room)return false;const x=tx*40,y=ty*40;for(const p of room.values()){const px=Number(p.x||0),py=Number(p.y||0);if(px< x+40&&px+30>x&&py<y+40&&py+40>y)return true}return false}
+function tileOccupiedByPlayer(world,tx,ty){pruneRoom(world);const room=worldPresence.get(world);if(!room)return false;const x=tx*40,y=ty*40;for(const p of room.values()){if(p.vanished)continue;const px=Number(p.x||0),py=Number(p.y||0);if(px< x+40&&px+30>x&&py<y+40&&py+40>y)return true}return false}
 function queueKnockback(playerId,ev){queueEvent(playerId,ev)}
 function consumeEvents(playerId){const q=knockbackEvents.get(playerId)||[];knockbackEvents.delete(playerId);return q}
 
@@ -201,7 +241,7 @@ function applyWorldAction(state,action,session,world){
   if(type==='player-punch'){
     const sourceId=session?.player?.playerId,targetId=String(action.targetPlayerId||'').slice(0,80),room=worldPresence.get(world);
     if(!sourceId||!targetId||targetId===sourceId||!room)return {accepted:false};pruneRoom(world);
-    const src=room.get(sourceId),target=room.get(targetId);if(!src||!target)return {accepted:false};
+    const src=room.get(sourceId),target=room.get(targetId);if(!src||!target)return {accepted:false};if(target.vanished&&!hasRole(session?.player?.role,'Moderator'))return {accepted:false};
     if(Array.isArray(state.snapshot.jammers)&&state.snapshot.jammers.some(j=>j?.type==='punch'))return {accepted:true,blocked:true};
     const sx=Number(src.x||0)+15,sy=Number(src.y||0)+20,txp=Number(target.x||0)+15,typ=Number(target.y||0)+20,dx=txp-sx,dy=Math.abs(typ-sy),facing=Number(src.facing)<0?-1:1;
     if(Math.sign(dx||facing)!==facing||Math.abs(dx)>98||dy>42)return {accepted:false};
@@ -211,7 +251,7 @@ function applyWorldAction(state,action,session,world){
     const sourceId=session?.player?.playerId,targetId=String(action.targetPlayerId||'').slice(0,80),cmd=String(action.command||'');
     const wl=Array.isArray(state.snapshot.locks)&&state.snapshot.locks.find(l=>l?.type==='worldLock'&&String(l.owner||'')===sourceId);
     const room=worldPresence.get(world);pruneRoom(world);const src=room?.get(sourceId),target=room?.get(targetId);
-    if(!wl||!src||!target||targetId===sourceId)return {accepted:false};
+    if(!wl||!src||!target||targetId===sourceId)return {accepted:false};if(roleRank(target.role)>roleRank(session?.player?.role||'Player'))return {accepted:false};
     if(cmd==='pull'){queueEvent(targetId,{type:'pull',world,x:Number(src.x||0),y:Number(src.y||0)-44,from:sourceId});return {accepted:true,command:'pull'}}
     if(cmd==='kick'){queueEvent(targetId,{type:'world-kick',world,reason:'KICKED',from:sourceId});return {accepted:true,command:'kick'}}
     if(cmd==='ban'){state.snapshot.worldBans=Array.isArray(state.snapshot.worldBans)?state.snapshot.worldBans:[];if(!state.snapshot.worldBans.includes(targetId))state.snapshot.worldBans.push(targetId);state.revision++;state.updatedAt=Date.now();queueEvent(targetId,{type:'world-kick',world,reason:'BANNED',from:sourceId});return {accepted:true,command:'ban',changed:true}}
@@ -280,9 +320,9 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.7.0',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.7.1',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
-    const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),player={playerId:'G-'+guestId,displayName:`${base}_#${guestSuffix(guestId)}`,accountType:'guest',role:'Player'},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
+    const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),player={playerId:'G-'+guestId,displayName:`${base}_#${guestSuffix(guestId)}`,accountType:'guest',role:'Player'};if(db.serverBans[player.playerId])return send(res,403,{error:'SERVER_BANNED'});const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
   }
   if(req.url==='/api/register'){
     const rawId=String(body.id||'').trim(),id=cleanId(rawId),pw=String(body.password||''),confirm=String(body.confirmPassword||''),email=cleanEmail(body.email);
@@ -296,12 +336,12 @@ async function api(req,res){
   if(req.url==='/api/login'){
     const rawId=String(body.id||'').trim(),id=cleanId(rawId),pw=String(body.password||''),account=db.accounts[id];
     if(!account)return send(res,404,{error:'ACCOUNT_NOT_FOUND'});
-    if(!verifyPassword(pw,account.pass))return send(res,401,{error:'INVALID_CREDENTIALS'});
+    if(!verifyPassword(pw,account.pass))return send(res,401,{error:'INVALID_CREDENTIALS'});if(db.serverBans[account.playerId])return send(res,403,{error:'SERVER_BANNED'});
     let changed=false;if(!account.username){account.username=String(account.displayName||account.id||rawId).replace(/_#\d{4}$/,'');changed=true}if(account.displayName!==account.username){account.displayName=account.username;changed=true}if(!('playerSave' in account)){account.playerSave=null;changed=true}if(!account.role){account.role=(OWNER_ACCOUNT_ID&&id===OWNER_ACCOUNT_ID)?'Owner':'Player';changed=true}if(changed){db.accounts[id]=account;saveDb(db)}
     const player={playerId:account.playerId,displayName:account.username,accountId:id,accountType:'account',role:roleForAccount(account)},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:account.playerSave||null})
   }
 
-  const auth=requireSession(req,res);if(!auth)return;const {token:t,session}=auth;
+  const auth=requireSession(req,res);if(!auth)return;const {token:t,session}=auth;if(db.serverBans[session.player.playerId])return send(res,403,{error:'SERVER_BANNED'});
   if(req.url==='/api/guest/convert'){
     if(session.player.accountType!=='guest')return send(res,409,{error:'ALREADY_ACCOUNT'});
     const rawId=String(body.id||'').trim(),id=cleanId(rawId),pw=String(body.password||''),confirm=String(body.confirmPassword||''),email=cleanEmail(body.email);
@@ -365,16 +405,18 @@ async function api(req,res){
     cancelTradeFor(session.player.playerId,'DISCONNECTED');removePresence(session.player.playerId);sessions.delete(t);if(session.player.accountType==='account'&&activeAccountTokens.get(session.player.accountId)===t)activeAccountTokens.delete(session.player.accountId);return send(res,200,{ok:true})
   }
   if(req.url==='/api/world/join'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),events:consumeEvents(session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.hellJail[session.player.playerId]&&world!==HELL_WORLD)return send(res,403,{error:'HELL_LOCKED',forceWorld:HELL_WORLD});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId,session.player.role),events:consumeEvents(session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode})
   }
   if(req.url==='/api/world/state'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId),events:consumeEvents(session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now()})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId,session.player.role),events:consumeEvents(session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now()})
   }
   if(req.url==='/api/world/action'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});const state=getOrCreateWorldState(world,null),result=applyWorldAction(state,body.action,session,world);if(result.accepted&&(result.knockback!==true&&result.blocked!==true))persistWorld(world,state);return send(res,result.accepted?200:409,{ok:result.accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(result.accepted?result:{error:'ACTION_REJECTED'})})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.hellJail[session.player.playerId]&&world!==HELL_WORLD)return send(res,403,{error:'HELL_LOCKED',forceWorld:HELL_WORLD});const state=getOrCreateWorldState(world,null),result=applyWorldAction(state,body.action,session,world);if(result.accepted&&(result.knockback!==true&&result.blocked!==true))persistWorld(world,state);return send(res,result.accepted?200:409,{ok:result.accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(result.accepted?result:{error:'ACTION_REJECTED'})})
   }
   if(req.url==='/api/world/chat'){
-    const world=cleanWorld(body.world),raw=String(body.text||'').trim().replace(/\s+/g,' ');if(raw.length>120)return send(res,400,{error:'CHAT_TOO_LONG'});const text=raw.slice(0,120);if(!world||!text)return send(res,400,{error:'BAD_REQUEST'});const state=getOrCreateWorldState(world,null);const msg={id:randomId('C'),playerId:session.player.playerId,name:session.player.displayName,text,at:Date.now()};state.chat=(state.chat||[]).concat(msg).slice(-30);persistWorld(world,state);return send(res,200,{ok:true,chat:state.chat})
+    const world=cleanWorld(body.world),raw=String(body.text||'').trim().replace(/\s+/g,' ');if(raw.length>180)return send(res,400,{error:'CHAT_TOO_LONG'});const text=raw.slice(0,180);if(!world||!text)return send(res,400,{error:'BAD_REQUEST'});if(db.hellJail[session.player.playerId]&&world!==HELL_WORLD)return send(res,403,{error:'HELL_LOCKED',forceWorld:HELL_WORLD});const state=getOrCreateWorldState(world,null);
+    if(text.startsWith('/')){const command=runChatCommand({raw:text,world,session,db});return send(res,command.ok?200:403,{ok:command.ok,chat:state.chat||[],command,...(!command.ok?{error:'COMMAND_DENIED'}:{})})}
+    const msg={id:randomId('C'),playerId:session.player.playerId,name:session.player.displayName,text:text.slice(0,120),at:Date.now()};state.chat=(state.chat||[]).concat(msg).slice(-30);persistWorld(world,state);return send(res,200,{ok:true,chat:state.chat})
   }
   if(req.url==='/api/world/leave'){
     const world=cleanWorld(body.world),room=worldPresence.get(world);if(room){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(world)}return send(res,200,{ok:true})
@@ -384,10 +426,10 @@ async function api(req,res){
 
 function staticFile(req,res){
   let url=req.url.split('?')[0];if(url==='/')url='/index.html';const file=path.normalize(path.join(ROOT,url));if(!file.startsWith(ROOT))return send(res,403,{error:'FORBIDDEN'});
-  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.7.0 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
+  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.7.1 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
 }
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
 
 async function shutdown(){try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
-initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.7.0 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.7.1 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
