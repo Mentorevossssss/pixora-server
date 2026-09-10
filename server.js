@@ -201,7 +201,7 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'14.6.1',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
     const base=cleanName(body.name),player={playerId:'G-'+crypto.randomUUID(),displayName:`${base}_#${suffix()}`,accountType:'guest'},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player)})
   }
@@ -254,10 +254,10 @@ async function api(req,res){
 
 function staticFile(req,res){
   let url=req.url.split('?')[0];if(url==='/')url='/index.html';const file=path.normalize(path.join(ROOT,url));if(!file.startsWith(ROOT))return send(res,403,{error:'FORBIDDEN'});
-  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
+  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 14.6.1 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
 }
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
 
 async function shutdown(){try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
-initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 14.6.1 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
