@@ -1,6 +1,6 @@
 {
   "name": "pixora-server",
-  "version": "14.7.1",
+  "version": "14.8.3",
   "private": true,
   "scripts": {
     "start": "node server.js"

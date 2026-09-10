@@ -17,5 +17,10 @@
     }
   },
   "worlds": {},
-  "reports": []
+  "reports": [],
+  "guests": {},
+  "sessions": {},
+  "auditLog": [],
+  "serverBans": {},
+  "hellJail": {}
 }
