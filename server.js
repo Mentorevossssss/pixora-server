@@ -415,7 +415,7 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'15.0',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'15.0.1',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
     const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),playerId='G-'+guestId;let g=db.guests[playerId];if(!g){g={playerId,guestId,displayName:`${base}_#${guestSuffix(guestId)}`,playerSave:null,createdAt:Date.now()};db.guests[playerId]=g;saveDb(db)}const player={playerId,displayName:g.displayName,accountType:'guest',role:'Player'};if(isServerBanned(db,player.playerId))return send(res,403,{error:'SERVER_BANNED'});const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:g.playerSave||null})
   }
@@ -426,14 +426,14 @@ async function api(req,res){
     if(db.accounts[id])return send(res,409,{error:'ACCOUNT_EXISTS'});
     if(Object.values(db.accounts).some(a=>String(a.email||'').toLowerCase()===email))return send(res,409,{error:'EMAIL_EXISTS'});
     const account={id,username:rawId,playerId:'A-'+crypto.randomUUID(),displayName:rawId,email,role:(OWNER_ACCOUNT_ID&&id===OWNER_ACCOUNT_ID)?'Owner':'Player',pass:hashPassword(pw),playerSave:null,createdAt:Date.now()};db.accounts[id]=account;saveDb(db);
-    const player={playerId:account.playerId,displayName:rawId,accountId:id,accountType:'account',role:roleForAccount(account)},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:null,testGrants:player.role==='Owner'?['alphaWing']:[]})
+    const player={playerId:account.playerId,displayName:rawId,accountId:id,accountType:'account',role:roleForAccount(account)},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:null,testGrants:player.role==='Owner'?['alphaWing','pixoraHat']:[]})
   }
   if(req.url==='/api/login'){
     const rawId=String(body.id||'').trim(),id=cleanId(rawId),pw=String(body.password||''),account=db.accounts[id];
     if(!account)return send(res,404,{error:'ACCOUNT_NOT_FOUND'});
     if(!verifyPassword(pw,account.pass))return send(res,401,{error:'INVALID_CREDENTIALS'});if(roleForAccount(account)!=='Owner'&&isServerBanned(db,account.playerId))return send(res,403,{error:'SERVER_BANNED'});
     let changed=false;if(!account.username){account.username=String(account.displayName||account.id||rawId).replace(/_#\d{4}$/,'');changed=true}if(account.displayName!==account.username){account.displayName=account.username;changed=true}if(!('playerSave' in account)){account.playerSave=null;changed=true}if(!account.role){account.role=(OWNER_ACCOUNT_ID&&id===OWNER_ACCOUNT_ID)?'Owner':'Player';changed=true}if(changed){db.accounts[id]=account;saveDb(db)}
-    const player={playerId:account.playerId,displayName:account.username,accountId:id,accountType:'account',role:roleForAccount(account)},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:account.playerSave||null,testGrants:roleForAccount(account)==='Owner'?['alphaWing']:[]})
+    const player={playerId:account.playerId,displayName:account.username,accountId:id,accountType:'account',role:roleForAccount(account)},t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:account.playerSave||null,testGrants:roleForAccount(account)==='Owner'?['alphaWing','pixoraHat']:[]})
   }
 
   const auth=requireSession(req,res);if(!auth)return;const {token:t,session}=auth;if(session.player.role!=='Owner'&&isServerBanned(db,session.player.playerId))return send(res,403,{error:'SERVER_BANNED'});
@@ -490,7 +490,7 @@ async function api(req,res){
     const id=String(body.tradeId||tradeByPlayer.get(session.player.playerId)||''),tr=trades.get(id);if(!tr||![tr.a,tr.b].includes(session.player.playerId))return send(res,404,{error:'TRADE_NOT_FOUND'});return send(res,200,{ok:true,trade:publicTrade(tr,db)})
   }
   if(req.url==='/api/trade/offer'){
-    const id=String(body.tradeId||tradeByPlayer.get(session.player.playerId)||''),tr=trades.get(id);if(!tr||tr.status!=='active'||![tr.a,tr.b].includes(session.player.playerId))return send(res,409,{error:'TRADE_INVALID'});const currentSave=getPlayerSave(db,session.player.playerId),inv=currentSave?.inventory||{};if(!currentSave)return send(res,409,{error:'SAVE_REQUIRED'});const offer={};for(const [item,raw] of Object.entries(body.offer||{}).slice(0,8)){const n=Math.max(0,Math.min(200,Math.floor(Number(raw||0))));if(!n||item==='spliceBook'||(IOTM_TESTING&&item==='alphaWing'))continue;if(Number(inv[item]||0)<n)return send(res,409,{error:'ITEM_CHANGED'});offer[String(item).slice(0,40)]=n}tr.offers[session.player.playerId]=offer;tr.confirmed[tr.a]=tr.confirmed[tr.b]=false;tr.finalConfirmed[tr.a]=tr.finalConfirmed[tr.b]=false;tr.status='active';tr.updatedAt=Date.now();queueEvent(tr.a,{type:'trade-updated',tradeId:id});queueEvent(tr.b,{type:'trade-updated',tradeId:id});return send(res,200,{ok:true,trade:publicTrade(tr,db)})
+    const id=String(body.tradeId||tradeByPlayer.get(session.player.playerId)||''),tr=trades.get(id);if(!tr||tr.status!=='active'||![tr.a,tr.b].includes(session.player.playerId))return send(res,409,{error:'TRADE_INVALID'});const currentSave=getPlayerSave(db,session.player.playerId),inv=currentSave?.inventory||{};if(!currentSave)return send(res,409,{error:'SAVE_REQUIRED'});const offer={};for(const [item,raw] of Object.entries(body.offer||{}).slice(0,8)){const n=Math.max(0,Math.min(200,Math.floor(Number(raw||0))));if(!n||item==='spliceBook'||(IOTM_TESTING&&item==='alphaWing')||item==='pixoraHat')continue;if(Number(inv[item]||0)<n)return send(res,409,{error:'ITEM_CHANGED'});offer[String(item).slice(0,40)]=n}tr.offers[session.player.playerId]=offer;tr.confirmed[tr.a]=tr.confirmed[tr.b]=false;tr.finalConfirmed[tr.a]=tr.finalConfirmed[tr.b]=false;tr.status='active';tr.updatedAt=Date.now();queueEvent(tr.a,{type:'trade-updated',tradeId:id});queueEvent(tr.b,{type:'trade-updated',tradeId:id});return send(res,200,{ok:true,trade:publicTrade(tr,db)})
   }
   if(req.url==='/api/trade/confirm'){
     const id=String(body.tradeId||tradeByPlayer.get(session.player.playerId)||''),tr=trades.get(id);if(!tr||![tr.a,tr.b].includes(session.player.playerId))return send(res,409,{error:'TRADE_INVALID'});const pid=session.player.playerId;
@@ -508,10 +508,10 @@ async function api(req,res){
   }
   if(req.url==='/api/trade/cancel'){cancelTradeFor(session.player.playerId,'CANCELLED');return send(res,200,{ok:true})}
   if(req.url==='/api/session'){
-    return send(res,200,{token:t,player:playerPayload(session.player),playerSave:getPlayerSave(db,session.player.playerId),storage:storageMode,testGrants:session.player.role==='Owner'?['alphaWing']:[],gemEvent:db.gemEvent||{multiplier:1,until:0}})
+    return send(res,200,{token:t,player:playerPayload(session.player),playerSave:getPlayerSave(db,session.player.playerId),storage:storageMode,testGrants:session.player.role==='Owner'?['alphaWing','pixoraHat']:[],gemEvent:db.gemEvent||{multiplier:1,until:0}})
   }
   if(req.url==='/api/player/save'){
-    const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});if(IOTM_TESTING&&session.player.role!=='Owner'){delete save.inventory.alphaWing;if(save.equipped?.back==='alphaWing')save.equipped.back=null}if(!setPlayerSave(db,session.player.playerId,save))return send(res,404,{error:'PLAYER_NOT_FOUND'});saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt})
+    const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});if(IOTM_TESTING&&session.player.role!=='Owner'){delete save.inventory.alphaWing;if(save.equipped?.back==='alphaWing')save.equipped.back=null;delete save.inventory.pixoraHat;if(save.equipped?.hair==='pixoraHat')save.equipped.hair=null}if(!setPlayerSave(db,session.player.playerId,save))return send(res,404,{error:'PLAYER_NOT_FOUND'});saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt})
   }
   if(req.url==='/api/player/load'){
     return send(res,200,{ok:true,playerSave:getPlayerSave(db,session.player.playerId)})
