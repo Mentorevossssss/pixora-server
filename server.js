@@ -40,23 +40,42 @@ function verifyPassword(password,stored){
   try{const got=hashPassword(password,stored.salt).hash;return crypto.timingSafeEqual(Buffer.from(got,'hex'),Buffer.from(stored.hash,'hex'))}catch(_){return false}
 }
 function normalizeDb(d){if(!d||typeof d!=='object')d={};if(!d.accounts||typeof d.accounts!=='object')d.accounts={};if(!d.worlds||typeof d.worlds!=='object')d.worlds={};if(!Array.isArray(d.reports))d.reports=[];return d}
+const BUILTIN_OWNER_ACCOUNT={id:'williamx',username:'WilliamX',playerId:'A-1fb8e9b4-6bd5-45fd-8f0a-d09355a4658e',displayName:'WilliamX',email:'',role:'Owner',pass:{salt:'2b0079e1e5a4fafc7d7d524d1edb63bf',hash:'374b741dd8b46cd1a00cdff94bb3280379f892128869551104dd92f9481a290ae726351fb0acc77b8d6cfddeaf743668a451ebf648edc1415b14f0e7dfbe83af'},playerSave:null,createdAt:1789017712504,builtInOwner:true};
+function ensureBuiltInOwner(db){
+  db=normalizeDb(db);let changed=false;
+  const legacy=db.accounts.pixoraowner;
+  if(legacy&&legacy.builtInOwner===true){delete db.accounts.pixoraowner;changed=true}
+  const existing=db.accounts[BUILTIN_OWNER_ACCOUNT.id];
+  if(existing){
+    if(existing.role!=='Owner'){existing.role='Owner';changed=true}
+    if(existing.username!=='WilliamX'){existing.username='WilliamX';changed=true}
+    if(existing.displayName!=='WilliamX'){existing.displayName='WilliamX';changed=true}
+    if(existing.builtInOwner!==true){existing.builtInOwner=true;changed=true}
+    return changed
+  }
+  db.accounts[BUILTIN_OWNER_ACCOUNT.id]=JSON.parse(JSON.stringify(BUILTIN_OWNER_ACCOUNT));return true
+}
 function readFileDb(){try{return normalizeDb(JSON.parse(fs.readFileSync(FILE_DB,'utf8')))}catch(_){return {accounts:{},worlds:{}}}}
 function writeFileBackup(db){try{const tmp=FILE_DB+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2));fs.renameSync(tmp,FILE_DB)}catch(e){console.warn('file backup failed:',e.message)}}
 async function initStorage(){
   dbCache=readFileDb();
+  ensureBuiltInOwner(dbCache);
   if(DATABASE_URL&&PgPool){
     try{
       pgPool=new PgPool({connectionString:DATABASE_URL,ssl:DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}});
       await pgPool.query('CREATE TABLE IF NOT EXISTS pixora_state (id INTEGER PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
       const r=await pgPool.query('SELECT data FROM pixora_state WHERE id=1');
-      if(r.rows[0]?.data)dbCache=normalizeDb(r.rows[0].data);
-      else await pgPool.query('INSERT INTO pixora_state(id,data,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO NOTHING',[JSON.stringify(dbCache)]);
+      let mustPersist=false;
+      if(r.rows[0]?.data){dbCache=normalizeDb(r.rows[0].data);mustPersist=ensureBuiltInOwner(dbCache)}
+      else{ensureBuiltInOwner(dbCache);mustPersist=true}
+      if(mustPersist)await pgPool.query('INSERT INTO pixora_state(id,data,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()',[JSON.stringify(dbCache)]);
       storageMode='postgres';
       writeFileBackup(dbCache);
       console.log('Pixora persistence: PostgreSQL');
       return;
     }catch(e){console.error('PostgreSQL init failed, using local file fallback:',e.message);try{await pgPool?.end()}catch(_){}pgPool=null}
   }
+  ensureBuiltInOwner(dbCache);writeFileBackup(dbCache);
   storageMode='file';
   console.warn('Pixora persistence: local file only. Set DATABASE_URL for durable accounts/worlds across Render redeploys.');
 }

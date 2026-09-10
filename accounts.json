@@ -1,0 +1,21 @@
+{
+  "accounts": {
+    "williamx": {
+      "id": "williamx",
+      "username": "WilliamX",
+      "playerId": "A-1fb8e9b4-6bd5-45fd-8f0a-d09355a4658e",
+      "displayName": "WilliamX",
+      "email": "",
+      "role": "Owner",
+      "pass": {
+        "salt": "2b0079e1e5a4fafc7d7d524d1edb63bf",
+        "hash": "374b741dd8b46cd1a00cdff94bb3280379f892128869551104dd92f9481a290ae726351fb0acc77b8d6cfddeaf743668a451ebf648edc1415b14f0e7dfbe83af"
+      },
+      "playerSave": null,
+      "createdAt": 1789017712504,
+      "builtInOwner": true
+    }
+  },
+  "worlds": {},
+  "reports": []
+}
