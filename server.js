@@ -9,7 +9,9 @@ try{PgPool=require('pg').Pool}catch(_){ }
 
 const PORT=Number(process.env.PORT||3000);
 const ROOT=path.join(__dirname,'public');
-const FILE_DB=path.join(__dirname,'accounts.json');
+const DATA_DIR=String(process.env.PIXORA_DATA_DIR||path.join(__dirname,'data'));
+const FILE_DB=String(process.env.PIXORA_DATA_FILE||path.join(DATA_DIR,'accounts.json'));
+const LEGACY_FILE_DB=path.join(__dirname,'accounts.json');
 const DATABASE_URL=String(process.env.DATABASE_URL||'').trim();
 const sessions=new Map();
 const revokedTokens=new Map();
@@ -32,6 +34,8 @@ let dbCache={accounts:{},worlds:{}};
 let pgPool=null;
 let storageMode='file';
 let persistQueue=Promise.resolve();
+let restartPlan={active:false,restartAt:0,startedAt:0,minutes:0,by:'',lastMarker:null};
+let restartTicker=null;
 
 function cleanWorld(v){return String(v||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,18)}
 function cleanId(v){return String(v||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,24)}
@@ -45,7 +49,7 @@ function hashPassword(password,salt=crypto.randomBytes(16).toString('hex')){retu
 function verifyPassword(password,stored){
   try{const got=hashPassword(password,stored.salt).hash;return crypto.timingSafeEqual(Buffer.from(got,'hex'),Buffer.from(stored.hash,'hex'))}catch(_){return false}
 }
-function normalizeDb(d){if(!d||typeof d!=='object')d={};if(!d.accounts||typeof d.accounts!=='object')d.accounts={};if(!d.guests||typeof d.guests!=='object')d.guests={};if(!d.sessions||typeof d.sessions!=='object')d.sessions={};if(!d.worlds||typeof d.worlds!=='object')d.worlds={};if(!Array.isArray(d.reports))d.reports=[];if(!Array.isArray(d.auditLog))d.auditLog=[];if(!d.serverBans||typeof d.serverBans!=='object')d.serverBans={};if(!d.hellJail||typeof d.hellJail!=='object')d.hellJail={};if(!d.friends||typeof d.friends!=='object')d.friends={};if(!Array.isArray(d.friendRequests))d.friendRequests=[];if(!d.mutes||typeof d.mutes!=='object')d.mutes={};if(!d.freezes||typeof d.freezes!=='object')d.freezes={};if(!d.playerNotes||typeof d.playerNotes!=='object')d.playerNotes={};if(!Array.isArray(d.tradeHistory))d.tradeHistory=[];if(!d.worldLogs||typeof d.worldLogs!=='object')d.worldLogs={};if(!d.bannedWorlds||typeof d.bannedWorlds!=='object')d.bannedWorlds={};if(!d.worldSlowmode||typeof d.worldSlowmode!=='object')d.worldSlowmode={};if(!d.gemEvent||typeof d.gemEvent!=='object')d.gemEvent={multiplier:1,until:0};return d}
+function normalizeDb(d){if(!d||typeof d!=='object')d={};if(!d.accounts||typeof d.accounts!=='object')d.accounts={};if(!d.guests||typeof d.guests!=='object')d.guests={};if(!d.sessions||typeof d.sessions!=='object')d.sessions={};if(!d.worlds||typeof d.worlds!=='object')d.worlds={};if(!Array.isArray(d.reports))d.reports=[];if(!Array.isArray(d.auditLog))d.auditLog=[];if(!d.serverBans||typeof d.serverBans!=='object')d.serverBans={};if(!d.hellJail||typeof d.hellJail!=='object')d.hellJail={};if(!d.friends||typeof d.friends!=='object')d.friends={};if(!Array.isArray(d.friendRequests))d.friendRequests=[];if(!d.mutes||typeof d.mutes!=='object')d.mutes={};if(!d.freezes||typeof d.freezes!=='object')d.freezes={};if(!d.playerNotes||typeof d.playerNotes!=='object')d.playerNotes={};if(!Array.isArray(d.tradeHistory))d.tradeHistory=[];if(!d.worldLogs||typeof d.worldLogs!=='object')d.worldLogs={};if(!d.bannedWorlds||typeof d.bannedWorlds!=='object')d.bannedWorlds={};if(!d.worldSlowmode||typeof d.worldSlowmode!=='object')d.worldSlowmode={};if(!d.gemEvent||typeof d.gemEvent!=='object')d.gemEvent={multiplier:1,until:0};if(!d.worldRecoveryBackups||typeof d.worldRecoveryBackups!=='object')d.worldRecoveryBackups={};return d}
 const BUILTIN_OWNER_ACCOUNT={id:'williamx',username:'Pixora',playerId:'A-1fb8e9b4-6bd5-45fd-8f0a-d09355a4658e',displayName:'Pixora',email:'',role:'Owner',pass:{salt:'2b0079e1e5a4fafc7d7d524d1edb63bf',hash:'374b741dd8b46cd1a00cdff94bb3280379f892128869551104dd92f9481a290ae726351fb0acc77b8d6cfddeaf743668a451ebf648edc1415b14f0e7dfbe83af'},playerSave:null,createdAt:1789017712504,builtInOwner:true};
 function ensureBuiltInOwner(db){
   db=normalizeDb(db);let changed=false;
@@ -61,8 +65,8 @@ function ensureBuiltInOwner(db){
   }
   db.accounts[BUILTIN_OWNER_ACCOUNT.id]=JSON.parse(JSON.stringify(BUILTIN_OWNER_ACCOUNT));return true
 }
-function readFileDb(){try{return normalizeDb(JSON.parse(fs.readFileSync(FILE_DB,'utf8')))}catch(_){return {accounts:{},worlds:{}}}}
-function writeFileBackup(db){try{const tmp=FILE_DB+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2));fs.renameSync(tmp,FILE_DB)}catch(e){console.warn('file backup failed:',e.message)}}
+function readFileDb(){for(const file of [FILE_DB,LEGACY_FILE_DB]){try{if(fs.existsSync(file))return normalizeDb(JSON.parse(fs.readFileSync(file,'utf8')))}catch(_){ }}return {accounts:{},worlds:{}}}
+function writeFileBackup(db){try{fs.mkdirSync(path.dirname(FILE_DB),{recursive:true});const tmp=FILE_DB+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db,null,2));fs.renameSync(tmp,FILE_DB)}catch(e){console.warn('file backup failed:',e.message)}}
 async function initStorage(){
   dbCache=readFileDb();
   ensureBuiltInOwner(dbCache);
@@ -113,7 +117,7 @@ function worldLockFor(world){const state=worldStates.get(world)||loadWorldFromDb
 function currentWorldOwner(world,playerId){const wl=worldLockFor(world);return !!wl&&String(wl.owner||'')===String(playerId||'')}
 function worldMembership(world,playerId){const wl=worldLockFor(world);if(!wl)return 'player';if(String(wl.owner||'')===String(playerId||''))return 'owner';if(Array.isArray(wl.trusted)&&wl.trusted.includes(String(playerId||'')))return 'admin';return 'player'}
 function publicHelp(worldOwner=false){const out=['/help','/who','/warp <world>','/mods','/rules','/worldinfo','/msg <player> <message>','/r <message>','/dance','/wave','/sleep','/laugh','/cry','/angry','/happy','/love','/shrug','/cheer','/facepalm','/point','/me <action>','/emote'];if(worldOwner)out.push('/pull <player>','/kick <player>','Wrench: grant/remove World Admin access');return out}
-function staffHelp(role){const out=[];if(hasRole(role,'Moderator'))out.push('/staffhelp','/warn <player> [reason]','/mute <player> [minutes] [reason]','/unmute <player>','/freeze <player>','/unfreeze <player>','/goto <player>','/reports','/staffchat <message>','/history <player>','/tradehistory <player>','/worldlog [world]','/note <player> <note>','/hidden [on|off]');if(hasRole(role,'Admin'))out.push('/ban <player> [reason]','/unban <id/player>','/tempban <player> <minutes> [reason]','/baninfo <player/id>','/forcewarp <player> <world>','/give <item> [amount] [player]','/announce <message>','/slowmode <seconds>','/eventxgems <x> [minutes]|off','/banworld <world> [reason]','/unbanworld <world>');if(role==='Owner')out.push('/role <player> <player|moderator|admin>','/hell <player> [reason]','/unhell <id/player>','/vanish','/unvanish','/staff [on|off]','/audit [count]','/resetserver');return out}
+function staffHelp(role){const out=[];if(hasRole(role,'Moderator'))out.push('/staffhelp','/warn <player> [reason]','/mute <player> [minutes] [reason]','/unmute <player>','/freeze <player>','/unfreeze <player>','/goto <player>','/reports','/staffchat <message>','/history <player>','/tradehistory <player>','/worldlog [world]','/note <player> <note>','/hidden [on|off]');if(hasRole(role,'Admin'))out.push('/ban <player> [reason]','/unban <id/player>','/tempban <player> <minutes> [reason]','/baninfo <player/id>','/forcewarp <player> <world>','/give <item> [amount] [player]','/announce <message>','/slowmode <seconds>','/eventxgems <x> [minutes]|off','/banworld <world> [reason]','/unbanworld <world>');if(role==='Owner')out.push('/role <player> <player|moderator|admin>','/hell <player> [reason]','/unhell <id/player>','/vanish','/unvanish','/staff [on|off]','/audit [count]','/resetserver <minutes>|cancel');return out}
 function commandError(message='Unknown command.'){return {ok:false,message}}
 function isServerBanned(db,playerId){const b=db.serverBans?.[playerId];if(!b)return null;if(Number(b.until||0)>0&&Date.now()>=Number(b.until)){delete db.serverBans[playerId];saveDb(db);return null}return b}
 function isMuted(db,playerId){const m=db.mutes?.[playerId];if(!m)return null;if(Number(m.until||0)>0&&Date.now()>=Number(m.until)){delete db.mutes[playerId];saveDb(db);return null}return m}
@@ -132,6 +136,31 @@ function friendSet(db,id){if(!Array.isArray(db.friends[id]))db.friends[id]=[];re
 function areFriends(db,a,b){return friendSet(db,a).has(b)&&friendSet(db,b).has(a)}
 function syncFriendSave(db,id){const save=getPlayerSave(db,id);if(save){save.friends=[...friendSet(db,id)];setPlayerSave(db,id,save)}}
 function moderationAnnounce(db,actor,text){broadcastSystem(db,text+(actor?.hidden?'':' • by '+(actor?.displayName||'Staff')),'MODERATION')}
+function publicRestartPlan(){return restartPlan.active?{active:true,restartAt:restartPlan.restartAt,startedAt:restartPlan.startedAt,minutes:restartPlan.minutes}:{active:false}}
+function restartAnnouncementFor(seconds){
+  if(seconds>60&&seconds%60===0)return `Server restart in ${Math.floor(seconds/60)} minute${seconds===60?'':'s'}.`;
+  if(seconds===60)return 'Server restart in 1 minute. Pixora restart theme started.';
+  if([50,40,30,20,10].includes(seconds))return `Server restart in ${seconds} seconds.`;
+  if(seconds>=1&&seconds<=9)return `Server restart in ${seconds}...`;
+  return '';
+}
+function markerForRestart(seconds){if(seconds>60){const mins=Math.ceil(seconds/60);return mins*60}if(seconds===60)return 60;if([50,40,30,20,10].includes(seconds))return seconds;if(seconds>=1&&seconds<=9)return seconds;return null}
+function flushAllWorldStates(){for(const [world,state] of worldStates)persistWorld(world,state);saveDb(loadDb())}
+function cancelServerRestart(db,actor){
+  if(!restartPlan.active)return false;restartPlan={active:false,restartAt:0,startedAt:0,minutes:0,by:'',lastMarker:null};if(restartTicker){clearInterval(restartTicker);restartTicker=null}
+  broadcastSystem(db,'Scheduled server restart was cancelled.','SYSTEM');if(actor)addAudit(db,actor,'cancel-reset-server','',{});saveDb(db);return true
+}
+function scheduleServerRestart(db,actor,minutes){
+  minutes=Math.max(1,Math.min(1440,Math.floor(Number(minutes||0))));if(restartPlan.active)return {ok:false,error:'RESTART_ALREADY_SCHEDULED'};
+  const now=Date.now();restartPlan={active:true,restartAt:now+minutes*60000,startedAt:now,minutes,by:actor?.playerId||'',lastMarker:null};
+  addAudit(db,actor,'reset-server','',{minutes});broadcastSystem(db,`Server restart scheduled in ${minutes} minute${minutes===1?'':'s'}.`,'SYSTEM');saveDb(db);
+  restartTicker=setInterval(async()=>{
+    if(!restartPlan.active)return;const seconds=Math.max(0,Math.ceil((restartPlan.restartAt-Date.now())/1000));
+    if(seconds<=0){if(restartTicker){clearInterval(restartTicker);restartTicker=null}restartPlan.active=false;broadcastSystem(loadDb(),'Server restarting now. Saving all worlds and sessions…','SYSTEM');flushAllWorldStates();try{await persistQueue}catch(_){}setTimeout(()=>shutdown(),250);return}
+    const marker=markerForRestart(seconds);if(marker!==null&&marker!==restartPlan.lastMarker){restartPlan.lastMarker=marker;const msg=restartAnnouncementFor(marker);if(msg)broadcastSystem(loadDb(),msg,'SYSTEM')}
+  },250);
+  return {ok:true,plan:publicRestartPlan()}
+}
 const EMOTES={dance:{text:'~ dance ~',duration:5000},wave:{text:'o/',duration:3000},sleep:{text:'-_- zZ',duration:6000},laugh:{text:'XD',duration:3000},cry:{text:'T_T',duration:3000},angry:{text:'>:(',duration:3000},happy:{text:'^_^',duration:3000},love:{text:'<3',duration:3000},shrug:{text:'¯\\_(ツ)_/¯',duration:3500},cheer:{text:'\\o/',duration:3000},facepalm:{text:'-_-;',duration:3000},point:{text:'->',duration:3000}};
 function runChatCommand({raw,world,session,db}){
   const parts=String(raw||'').trim().slice(1).split(/\s+/),cmd=String(parts.shift()||'').toLowerCase(),role=session.player.role||'Player',pid=session.player.playerId;
@@ -190,7 +219,7 @@ function runChatCommand({raw,world,session,db}){
   if(cmd==='vanish'||cmd==='unvanish'){if(role!=='Owner')return commandError();const on=cmd==='vanish';session.player.vanished=on;const p=room?.get(pid);if(p)p.vanished=on;addAudit(db,session.player,on?'vanish':'unvanish',pid,{});saveDb(db);return ok(on?'Vanish ON':'Vanish OFF',{vanished:on})}
   if(cmd==='staff'){if(role!=='Owner')return commandError();const arg=String(parts[0]||'').toLowerCase(),on=arg==='on'?true:arg==='off'?false:!session.player.staffMode;session.player.staffMode=on;const p=room?.get(pid);if(p)p.staffMode=on;addAudit(db,session.player,'staff-mode',pid,{enabled:on});saveDb(db);return ok(on?'Staff Mode ON • fly/noclip aktif':'Staff Mode OFF',{staffMode:on})}
   if(cmd==='audit'){if(role!=='Owner')return commandError();const n=Math.max(1,Math.min(10,Math.floor(Number(parts[0]||5)))),rows=(db.auditLog||[]).slice(-n).reverse().map(a=>a.actorName+' '+a.action+(a.target?' → '+a.target:'')).join(' | ');return ok(rows||'Audit log kosong.',{history:true,historyName:'AUDIT'})}
-  if(cmd==='resetserver'){if(role!=='Owner')return commandError();addAudit(db,session.player,'reset-server','',{});broadcastSystem(db,'Server restart requested. Saving worlds and sessions…','SYSTEM');saveDb(db);return ok('Server restart scheduled after save.',{resetServer:true})}
+  if(cmd==='resetserver'){if(role!=='Owner')return commandError();const arg=String(parts[0]||'').toLowerCase();if(arg==='cancel'){if(!restartPlan.active)return commandError('Tidak ada restart countdown aktif.');cancelServerRestart(db,session.player);return ok('Server restart cancelled.',{restartCancelled:true,serverRestart:publicRestartPlan()})}const minutes=Math.floor(Number(arg));if(!Number.isFinite(minutes)||minutes<1||minutes>1440)return commandError('Pakai: /resetserver <minutes> atau /resetserver cancel');const scheduled=scheduleServerRestart(db,session.player,minutes);if(!scheduled.ok)return commandError('Restart countdown sudah aktif. Pakai /resetserver cancel dulu.');return ok(`Server restart scheduled in ${minutes} minute${minutes===1?'':'s'}.`,{serverRestart:scheduled.plan})}
   return commandError();
 }
 function accountByPlayerId(db,playerId){return Object.values(db.accounts||{}).find(a=>a&&a.playerId===playerId)||null}
@@ -264,11 +293,11 @@ function sanitizeWorldSnapshot(input){
   const blocks=Array.isArray(s.blocks)?s.blocks.slice(0,20000).filter(b=>b&&Number.isFinite(Number(b.x))&&Number.isFinite(Number(b.y))&&typeof b.t==='string').map(b=>({x:Number(b.x),y:Number(b.y),t:String(b.t).slice(0,32)})):[];
   const door=(s.door&&Number.isFinite(Number(s.door.x))&&Number.isFinite(Number(s.door.y)))?{x:Number(s.door.x),y:Number(s.door.y),w:Number(s.door.w)||36,h:Number(s.door.h)||40}:null;
   const placedDoors=Array.isArray(s.placedDoors)?s.placedDoors.slice(0,1000).filter(d=>d&&Number.isFinite(Number(d.tx))&&Number.isFinite(Number(d.ty))&&['woodDoor','worldDoor'].includes(String(d.type||''))).map(d=>({id:String(d.id||randomId('DOOR')).slice(0,80),tx:Math.floor(Number(d.tx)),ty:Math.floor(Number(d.ty)),type:String(d.type),owner:String(d.owner||'').slice(0,80),doorId:String(d.doorId||'').replace(/[^A-Za-z0-9_-]/g,'').slice(0,18),targetWorld:cleanWorld(d.targetWorld),targetId:String(d.targetId||'').replace(/[^A-Za-z0-9_-]/g,'').slice(0,18),open:!!d.open})):[];
-  return {worldId:String(s.worldId||'').slice(0,64),surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,blocks,door,placedDoors,caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],plants:Array.isArray(s.plants)?s.plants.slice(0,5000).map(p=>sanitizePlant(p,Math.floor(Number(p?.tx)),Math.floor(Number(p?.ty)))).filter(Boolean):[],locks:Array.isArray(s.locks)?s.locks.slice(0,1000).filter(l=>l&&Number.isFinite(Number(l.tx))&&Number.isFinite(Number(l.ty))).map(l=>({...l,tx:Math.floor(Number(l.tx)),ty:Math.floor(Number(l.ty)),type:String(l.type||'worldLock').slice(0,32),owner:String(l.owner||'').slice(0,80),trusted:Array.isArray(l.trusted)?l.trusted.slice(0,200).map(v=>String(v).slice(0,80)):[]})):[],weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],jammers,worldBans:Array.isArray(s.worldBans)?s.worldBans.slice(0,500).map(v=>String(v).slice(0,80)):[],weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},drops:Array.isArray(s.drops)?s.drops.slice(0,5000).map(sanitizeDrop).filter(Boolean):[]}
+  return {worldId:String(s.worldId||'').slice(0,64),surfaceTile:Number.isFinite(Number(s.surfaceTile))?Number(s.surfaceTile):55,blocks,door,placedDoors,caveBgRemoved:Array.isArray(s.caveBgRemoved)?s.caveBgRemoved.slice(0,12000).filter(v=>typeof v==='string'):[],plants:Array.isArray(s.plants)?s.plants.slice(0,5000).map(p=>sanitizePlant(p,Math.floor(Number(p?.tx)),Math.floor(Number(p?.ty)))).filter(Boolean):[],locks:Array.isArray(s.locks)?s.locks.slice(0,1000).filter(l=>l&&Number.isFinite(Number(l.tx))&&Number.isFinite(Number(l.ty))).map(l=>({...l,tx:Math.floor(Number(l.tx)),ty:Math.floor(Number(l.ty)),type:String(l.type||'worldLock').slice(0,32),owner:String(l.owner||'').slice(0,80),trusted:Array.isArray(l.trusted)?l.trusted.slice(0,200).map(v=>String(v).slice(0,80)):[]})):[],weatherOrbs:Array.isArray(s.weatherOrbs)?s.weatherOrbs.slice(0,100):[],jammers,worldBans:Array.isArray(s.worldBans)?s.worldBans.slice(0,500).map(v=>String(v).slice(0,80)):[],weather:(s.weather&&typeof s.weather==='object')?{type:String(s.weather.type||'sunny').slice(0,16)}:{type:'sunny'},drops:Array.isArray(s.drops)?s.drops.slice(0,5000).map(sanitizeDrop).filter(Boolean):[],savedAt:Math.max(0,Number(s.savedAt||0))}
 }
 function sanitizePlant(p,tx,ty){
   if(!p||typeof p!=='object')return null;const seed=String(p.seed||'').slice(0,40);if(!seed)return null;
-  return {tx,ty,seed,spliced:!!p.spliced,rarity:Math.max(1,Math.min(99,Number(p.rarity||1))),plantedAt:Math.max(0,Number(p.plantedAt||Date.now())),growMs:Math.max(1000,Number(p.growMs||10000)),hitsTaken:Math.max(0,Math.min(99,Math.floor(Number(p.hitsTaken||0)))),lastHitAt:Math.max(0,Number(p.lastHitAt||0))}
+  const rarity=Math.max(1,Math.min(99,Number(p.rarity||1))),growMs=30000+(Math.floor(rarity)-1)*15000;return {tx,ty,seed,spliced:!!p.spliced,rarity,plantedAt:Math.max(0,Number(p.plantedAt||Date.now())),growMs,hitsTaken:Math.max(0,Math.min(99,Math.floor(Number(p.hitsTaken||0)))),lastHitAt:Math.max(0,Number(p.lastHitAt||0))}
 }
 function migrateLegacySurfaceGrass(snapshot){
   if(!snapshot||!Array.isArray(snapshot.blocks))return false;
@@ -287,6 +316,18 @@ function loadWorldFromDb(world){
 }
 function persistWorld(world,state){const db=loadDb();db.worlds[world]={revision:state.revision,snapshot:state.snapshot,chat:(state.chat||[]).slice(-30),updatedAt:Date.now()};saveDb(db)}
 function getOrCreateWorldState(world,clientSnapshot){let state=worldStates.get(world)||loadWorldFromDb(world);if(!state){const snapshot=sanitizeWorldSnapshot(clientSnapshot);migrateLegacySurfaceGrass(snapshot);state={revision:1,snapshot,chat:[],updatedAt:Date.now()};worldStates.set(world,state);persistWorld(world,state)}return state}
+function worldActivityScore(s){if(!s)return 0;return (s.locks?.length||0)*50+(s.plants?.length||0)*14+(s.placedDoors?.length||0)*22+(s.weatherOrbs?.length||0)*10+(s.jammers?.length||0)*10+(s.caveBgRemoved?.length||0)*2+(s.worldBans?.length||0)*10}
+function maybeRecoverFreshWorldFromClient(world,state,input,playerId){
+  if(!state||!input||typeof input!=='object')return false;const client=sanitizeWorldSnapshot(input),serverSnap=state.snapshot;
+  if(!client.worldId||!serverSnap?.worldId||client.worldId===serverSnap.worldId||client.blocks.length<80)return false;
+  const age=Date.now()-Number(state.updatedAt||0),serverActivity=worldActivityScore(serverSnap),clientActivity=worldActivityScore(client),blockDelta=Math.abs(client.blocks.length-(serverSnap.blocks?.length||0));
+  const serverLooksFresh=state.revision<=3&&age>=0&&age<30*60*1000&&serverActivity<=10;
+  const clientHasOwnership=(client.locks||[]).some(l=>String(l.owner||'')===String(playerId||''));
+  const clientHasHistory=clientHasOwnership||clientActivity>=14||blockDelta>=8;
+  if(!serverLooksFresh||!clientHasHistory)return false;
+  const db=loadDb(),rows=Array.isArray(db.worldRecoveryBackups?.[world])?db.worldRecoveryBackups[world]:[];rows.unshift({at:Date.now(),revision:state.revision,snapshot:serverSnap});db.worldRecoveryBackups[world]=rows.slice(0,3);
+  state.snapshot=client;state.revision=Math.max(1,Number(state.revision||1))+1;state.updatedAt=Date.now();persistWorld(world,state);return true
+}
 
 const DROP_RATE={grass:{block:.42,seed:.30,gems:.28},dirt:{block:.38,seed:.20,gems:.24},stone:{block:.32,seed:.08,gems:.34},wood:{block:.45,seed:.24,gems:.25},leaf:{block:.24,seed:.42,gems:.22},sand:{block:.40,seed:.18,gems:.22},glass:{block:.31,seed:.12,gems:.38},brick:{block:.36,seed:.12,gems:.32},ice:{block:.34,seed:.22,gems:.30},metal:{block:.28,seed:.06,gems:.46},caveStone:{block:.32,seed:.10,gems:.40},moss:{block:.36,seed:.34,gems:.24},lava:{block:.22,seed:0,gems:.44},farmBlock:{block:.46,seed:.34,gems:.38},woodPlatform:{block:.45,seed:.20,gems:.20},woodDoor:{block:.40,seed:.16,gems:.24},worldDoor:{block:.30,seed:.10,gems:.34}};
 const SEED_FOR_BLOCK={grass:'grassSeed',dirt:'dirtSeed',stone:'stoneSeed',wood:'woodSeed',leaf:'leafSeed',sand:'sandSeed',glass:'glassSeed',brick:'brickSeed',ice:'iceSeed',metal:'metalSeed',caveStone:'caveStoneSeed',moss:'mossSeed',farmBlock:'farmSeed',woodPlatform:'platformSeed',woodDoor:'doorSeed',worldDoor:'worldDoorSeed'};
@@ -415,7 +456,7 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'15.0.2',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'15.0.3',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
     const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),playerId='G-'+guestId;let g=db.guests[playerId];if(!g){g={playerId,guestId,displayName:`${base}_#${guestSuffix(guestId)}`,playerSave:null,createdAt:Date.now()};db.guests[playerId]=g;saveDb(db)}const player={playerId,displayName:g.displayName,accountType:'guest',role:'Player'};if(isServerBanned(db,player.playerId))return send(res,403,{error:'SERVER_BANNED'});const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:g.playerSave||null})
   }
@@ -509,7 +550,7 @@ async function api(req,res){
   if(req.url==='/api/trade/cancel'){cancelTradeFor(session.player.playerId,'CANCELLED');return send(res,200,{ok:true})}
   if(req.url==='/api/session'){
     const sk=sessionKey(t);if(db.sessions?.[sk]){db.sessions[sk].lastSeen=Date.now();saveDb(db)}
-    return send(res,200,{token:t,player:playerPayload(session.player),playerSave:getPlayerSave(db,session.player.playerId),storage:storageMode,testGrants:session.player.role==='Owner'?['alphaWing','pixoraHat']:[],gemEvent:db.gemEvent||{multiplier:1,until:0}})
+    return send(res,200,{token:t,player:playerPayload(session.player),playerSave:getPlayerSave(db,session.player.playerId),storage:storageMode,testGrants:session.player.role==='Owner'?['alphaWing','pixoraHat']:[],gemEvent:db.gemEvent||{multiplier:1,until:0},serverRestart:publicRestartPlan()})
   }
   if(req.url==='/api/player/save'){
     const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});if(IOTM_TESTING&&session.player.role!=='Owner'){delete save.inventory.alphaWing;if(save.equipped?.back==='alphaWing')save.equipped.back=null;delete save.inventory.pixoraHat;if(save.equipped?.hat==='pixoraHat')save.equipped.hat=null;if(save.equipped?.hair==='pixoraHat')save.equipped.hair=null}if(!setPlayerSave(db,session.player.playerId,save))return send(res,404,{error:'PLAYER_NOT_FOUND'});saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt})
@@ -521,10 +562,10 @@ async function api(req,res){
     cancelTradeFor(session.player.playerId,'DISCONNECTED');removePresence(session.player.playerId);sessions.delete(t);delete db.sessions[sessionKey(t)];if(session.player.accountType==='account'&&activeAccountTokens.get(session.player.accountId)===t)activeAccountTokens.delete(session.player.accountId);saveDb(db);return send(res,200,{ok:true})
   }
   if(req.url==='/api/world/join'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.hellJail[session.player.playerId]&&world!==HELL_WORLD)return send(res,403,{error:'HELL_LOCKED',forceWorld:HELL_WORLD});if(db.bannedWorlds?.[world]&&!hasRole(session.player.role,'Moderator'))return send(res,403,{error:'WORLD_CLOSED',reason:db.bannedWorlds[world].reason||''});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId,session.player.role),events:consumeEvents(session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode,worldRole:worldMembership(world,session.player.playerId),gemEvent:db.gemEvent||{multiplier:1,until:0}})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.hellJail[session.player.playerId]&&world!==HELL_WORLD)return send(res,403,{error:'HELL_LOCKED',forceWorld:HELL_WORLD});if(db.bannedWorlds?.[world]&&!hasRole(session.player.role,'Moderator'))return send(res,403,{error:'WORLD_CLOSED',reason:db.bannedWorlds[world].reason||''});const state=getOrCreateWorldState(world,body.worldSnapshot),worldRecovered=maybeRecoverFreshWorldFromClient(world,state,body.worldSnapshot,session.player.playerId);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});for(const [w,room] of worldPresence){if(w!==world){room.delete(session.player.playerId);if(!room.size)worldPresence.delete(w)}}const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId,session.player.role),events:consumeEvents(session.player.playerId),revision:state.revision,worldSnapshot:state.snapshot,chat:(state.chat||[]).slice(-30),storage:storageMode,worldRole:worldMembership(world,session.player.playerId),gemEvent:db.gemEvent||{multiplier:1,until:0},serverRestart:publicRestartPlan(),worldRecovered})
   }
   if(req.url==='/api/world/state'){
-    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.bannedWorlds?.[world]&&!hasRole(session.player.role,'Moderator'))return send(res,403,{error:'WORLD_CLOSED',reason:db.bannedWorlds[world].reason||''});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId,session.player.role),events:consumeEvents(session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now(),worldRole:worldMembership(world,session.player.playerId),gemEvent:db.gemEvent||{multiplier:1,until:0}})
+    const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.bannedWorlds?.[world]&&!hasRole(session.player.role,'Moderator'))return send(res,403,{error:'WORLD_CLOSED',reason:db.bannedWorlds[world].reason||''});const state=getOrCreateWorldState(world,body.worldSnapshot);if(Array.isArray(state.snapshot.worldBans)&&state.snapshot.worldBans.includes(session.player.playerId))return send(res,403,{error:'WORLD_BANNED'});const cap=canJoinWorld(world,session.player.playerId);if(!cap.ok)return send(res,409,{error:cap.error,maxWorld:MAX_WORLD_PLAYERS,maxServer:MAX_SERVER_PLAYERS});updatePresence(world,session.player,body);const known=Math.max(0,Number(body.knownRevision||0));return send(res,200,{ok:true,world,players:roomView(world,session.player.playerId,session.player.role),events:consumeEvents(session.player.playerId),revision:state.revision,...(known<state.revision?{worldSnapshot:state.snapshot}:{}),chat:(state.chat||[]).slice(-30),serverTime:Date.now(),worldRole:worldMembership(world,session.player.playerId),gemEvent:db.gemEvent||{multiplier:1,until:0},serverRestart:publicRestartPlan()})
   }
   if(req.url==='/api/world/action'){
     const world=cleanWorld(body.world);if(!world)return send(res,400,{error:'BAD_WORLD'});if(db.hellJail[session.player.playerId]&&world!==HELL_WORLD)return send(res,403,{error:'HELL_LOCKED',forceWorld:HELL_WORLD});if(db.bannedWorlds?.[world]&&!hasRole(session.player.role,'Moderator'))return send(res,403,{error:'WORLD_CLOSED'});const state=getOrCreateWorldState(world,null),result=applyWorldAction(state,body.action,session,world);if(result.accepted&&(result.knockback!==true&&result.blocked!==true))persistWorld(world,state);return send(res,result.accepted?200:409,{ok:result.accepted,world,revision:state.revision,actionId:String(body.actionId||'').slice(0,80),...(result.accepted?result:{error:'ACTION_REJECTED'})})
@@ -534,7 +575,6 @@ async function api(req,res){
     if(text.startsWith('/')){
       const command=runChatCommand({raw:text,world,session,db});
       if(command.ok&&command.history){const m={id:randomId('SYS'),playerId:'',name:String(command.historyName||'SYSTEM').slice(0,32),text:String(command.message||'').slice(0,700),at:Date.now(),system:true};state.chat=(state.chat||[]).concat(m).slice(-30);persistWorld(world,state)}
-      if(command.ok&&command.resetServer)setTimeout(()=>shutdown(),500);
       return send(res,command.ok?200:403,{ok:command.ok,chat:state.chat||[],command,...(!command.ok?{error:'COMMAND_DENIED'}:{})})
     }
     const mute=isMuted(db,session.player.playerId);if(mute)return send(res,403,{error:'MUTED',until:mute.until||0,reason:mute.reason||''});
@@ -549,10 +589,10 @@ async function api(req,res){
 
 function staticFile(req,res){
   let url=req.url.split('?')[0];if(url==='/')url='/index.html';const file=path.normalize(path.join(ROOT,url));if(!file.startsWith(ROOT))return send(res,403,{error:'FORBIDDEN'});
-  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 15.0 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
+  fs.readFile(file,(err,data)=>{if(err){res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});return res.end(`Pixora Server Build 15.0.3 is live | storage=${storageMode}`)}const ext=path.extname(file),type=ext==='.html'?'text/html; charset=utf-8':ext==='.js'?'application/javascript':'application/octet-stream';res.writeHead(200,{'Content-Type':type});res.end(data)})
 }
 const server=http.createServer((req,res)=>{if(req.url.startsWith('/api/'))return api(req,res);return staticFile(req,res)});
 
-async function shutdown(){try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
+async function shutdown(){try{flushAllWorldStates()}catch(_){}try{await persistQueue}catch(_){}try{await pgPool?.end()}catch(_){}process.exit(0)}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
-initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 15.0 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
+initStorage().then(()=>server.listen(PORT,()=>console.log(`Pixora Build 15.0.3 server running on port ${PORT}`))).catch(e=>{console.error(e);process.exit(1)});
