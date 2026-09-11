@@ -248,7 +248,7 @@ function updatePresence(world,p,b){
 function roomView(world,selfId,viewerRole='Player'){pruneRoom(world);const room=worldPresence.get(world);return room?[...room.values()].filter(p=>p.playerId!==selfId&&(!p.vanished||hasRole(viewerRole,'Moderator'))).map(({lastSeen,vanished,staffMode,hidden,...p})=>({...p,role:hidden?'Player':p.role,worldRole:worldMembership(world,p.playerId)})):[]}
 function activePresenceIds(){const ids=new Set();for(const [w] of worldPresence){pruneRoom(w);const room=worldPresence.get(w);if(room)for(const id of room.keys())ids.add(id)}return ids}
 function canJoinWorld(world,playerId){pruneRoom(world);const room=worldPresence.get(world);if(room?.has(playerId))return {ok:true};if((room?.size||0)>=MAX_WORLD_PLAYERS)return {ok:false,error:'WORLD_FULL'};if(activePresenceIds().size>=MAX_SERVER_PLAYERS)return {ok:false,error:'SERVER_FULL'};return {ok:true}}
-function tileOccupiedByPlayer(world,tx,ty){pruneRoom(world);const room=worldPresence.get(world);if(!room)return false;const x=tx*40,y=ty*40;for(const p of room.values()){if(p.vanished)continue;const px=Number(p.x||0),py=Number(p.y||0);if(px< x+40&&px+30>x&&py<y+40&&py+40>y)return true}return false}
+function tileOccupiedByPlayer(world,tx,ty){pruneRoom(world);const room=worldPresence.get(world);if(!room)return false;const x=tx*40,y=ty*40;for(const p of room.values()){if(p.vanished)continue;/* Match client movement collision body: wearables/wing visuals never expand placement collision. */const px=Number(p.x||0)+3,py=Number(p.y||0)+8,pw=24,ph=30;if(px<x+40&&px+pw>x&&py<y+40&&py+ph>y)return true}return false}
 function queueKnockback(playerId,ev){queueEvent(playerId,ev)}
 function consumeEvents(playerId){const q=knockbackEvents.get(playerId)||[];knockbackEvents.delete(playerId);return q}
 
@@ -415,7 +415,7 @@ async function api(req,res){
   let body={};try{body=await readJson(req)}catch(_){return send(res,400,{error:'BAD_REQUEST'})}
   const db=loadDb();
 
-  if(req.url==='/api/status')return send(res,200,{ok:true,build:'15.0.1',storage:storageMode,persistent:storageMode==='postgres'});
+  if(req.url==='/api/status')return send(res,200,{ok:true,build:'15.0.2',storage:storageMode,persistent:storageMode==='postgres'});
   if(req.url==='/api/guest'){
     const base=cleanName(body.name),guestId=cleanGuestId(body.guestId)||crypto.randomUUID(),playerId='G-'+guestId;let g=db.guests[playerId];if(!g){g={playerId,guestId,displayName:`${base}_#${guestSuffix(guestId)}`,playerSave:null,createdAt:Date.now()};db.guests[playerId]=g;saveDb(db)}const player={playerId,displayName:g.displayName,accountType:'guest',role:'Player'};if(isServerBanned(db,player.playerId))return send(res,403,{error:'SERVER_BANNED'});const t=createSession(player);return send(res,200,{token:t,player:playerPayload(player),playerSave:g.playerSave||null})
   }
@@ -508,10 +508,11 @@ async function api(req,res){
   }
   if(req.url==='/api/trade/cancel'){cancelTradeFor(session.player.playerId,'CANCELLED');return send(res,200,{ok:true})}
   if(req.url==='/api/session'){
+    const sk=sessionKey(t);if(db.sessions?.[sk]){db.sessions[sk].lastSeen=Date.now();saveDb(db)}
     return send(res,200,{token:t,player:playerPayload(session.player),playerSave:getPlayerSave(db,session.player.playerId),storage:storageMode,testGrants:session.player.role==='Owner'?['alphaWing','pixoraHat']:[],gemEvent:db.gemEvent||{multiplier:1,until:0}})
   }
   if(req.url==='/api/player/save'){
-    const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});if(IOTM_TESTING&&session.player.role!=='Owner'){delete save.inventory.alphaWing;if(save.equipped?.back==='alphaWing')save.equipped.back=null;delete save.inventory.pixoraHat;if(save.equipped?.hair==='pixoraHat')save.equipped.hair=null}if(!setPlayerSave(db,session.player.playerId,save))return send(res,404,{error:'PLAYER_NOT_FOUND'});saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt})
+    const save=sanitizePlayerSave(body.save);if(!save)return send(res,400,{error:'BAD_SAVE'});if(IOTM_TESTING&&session.player.role!=='Owner'){delete save.inventory.alphaWing;if(save.equipped?.back==='alphaWing')save.equipped.back=null;delete save.inventory.pixoraHat;if(save.equipped?.hat==='pixoraHat')save.equipped.hat=null;if(save.equipped?.hair==='pixoraHat')save.equipped.hair=null}if(!setPlayerSave(db,session.player.playerId,save))return send(res,404,{error:'PLAYER_NOT_FOUND'});saveDb(db);return send(res,200,{ok:true,savedAt:save.savedAt})
   }
   if(req.url==='/api/player/load'){
     return send(res,200,{ok:true,playerSave:getPlayerSave(db,session.player.playerId)})
